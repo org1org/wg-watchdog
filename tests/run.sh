@@ -6,6 +6,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 WATCHDOG="$REPO_DIR/wg-watchdog.sh"
 INSTALLER="$REPO_DIR/install.sh"
+MANAGER="$REPO_DIR/wg-watchdog-manager.sh"
+VERSION_FILE="$REPO_DIR/VERSION"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/wg-watchdog-tests.XXXXXX")
 TEST_NUMBER=0
 PASS_COUNT=0
@@ -30,7 +32,7 @@ assert_equal() {
 }
 
 assert_contains() {
-    grep -F "$2" "$1" >/dev/null 2>&1 || fail "$3: в $1 нет '$2'"
+    grep -F -- "$2" "$1" >/dev/null 2>&1 || fail "$3: в $1 нет '$2'"
 }
 
 assert_empty() {
@@ -253,7 +255,7 @@ pass "опасные числовые значения отклоняются"
 WG_WATCHDOG_LIB_ONLY=yes
 export WG_WATCHDOG_LIB_ONLY
 # shellcheck disable=SC1090
-. "$INSTALLER"
+. "$MANAGER"
 trap cleanup_tests EXIT HUP INT TERM
 valid_interval 5 || fail "интервал 5 отклонён"
 valid_interval 60 || fail "интервал 60 отклонён"
@@ -467,5 +469,87 @@ pass "неизменившийся crontab не записывается пов�
 assert_contains "$WATCHDOG" 'STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"' "RAM state dir"
 assert_contains "$WATCHDOG" 'RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"' "RAM lock dir"
 pass "состояние и блокировки по умолчанию размещены в RAM"
+
+# Версии всех распространяемых файлов должны совпадать.
+release_version=$(sed -n '1p' "$VERSION_FILE")
+manager_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$MANAGER" | head -n 1)
+watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$WATCHDOG" | head -n 1)
+installer_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$INSTALLER" | head -n 1)
+assert_equal "$manager_version" "$release_version" "версия менеджера"
+assert_equal "$watchdog_version" "$release_version" "версия watchdog"
+assert_equal "$installer_version" "$release_version" "версия установщика"
+pass "версии распространяемых файлов совпадают"
+
+# Семантическое сравнение и загрузка небольшого файла VERSION.
+version_is_newer 1.10.0 1.9.9 || fail "1.10.0 не распознана как новая версия"
+if version_is_newer 1.2.9 1.3.0; then fail "старая версия распознана как новая"; fi
+printf '1.4.0\n' > "$TEST_ROOT/remote-version"
+VERSION_URL="$TEST_ROOT/remote-version"
+download_file() { cp "$1" "$2"; }
+check_update_status
+assert_equal "$UPDATE_AVAILABLE" yes "доступность обновления"
+assert_equal "$REMOTE_VERSION" 1.4.0 "номер удалённой версии"
+pass "проверка обновлений использует корректное сравнение версий"
+
+# Короткая команда создаётся только в свободном месте и не затирает коллизию.
+SHORT_COMMAND="$TEST_ROOT/bin-free/wgwm"
+MANAGER_PATH="$TEST_ROOT/bin-free/wg-watchdog-manager"
+mkdir -p "$TEST_ROOT/bin-free"
+: > "$MANAGER_PATH"
+ensure_short_command
+[ -L "$SHORT_COMMAND" ] || fail "символическая ссылка wgwm не создана"
+assert_equal "$(readlink "$SHORT_COMMAND")" "$MANAGER_PATH" "назначение wgwm"
+rm -f "$SHORT_COMMAND"
+printf 'чужая команда\n' > "$SHORT_COMMAND"
+ensure_short_command > "$TEST_ROOT/wgwm-collision"
+assert_contains "$SHORT_COMMAND" 'чужая команда' "защита занятого имени wgwm"
+assert_contains "$TEST_ROOT/wgwm-collision" 'уже занят' "сообщение о коллизии wgwm"
+pass "команда wgwm создаётся безопасно"
+
+# Шапка содержит назначение, автора и версию; интерфейсы выводятся отдельным блоком.
+COLOR_CYAN=''
+COLOR_RESET=''
+show_header > "$TEST_ROOT/header"
+assert_contains "$TEST_ROOT/header" 'WG Watchdog Manager' "заголовок"
+assert_contains "$TEST_ROOT/header" 'Автор: org1org' "автор"
+assert_contains "$TEST_ROOT/header" "Версия: $VERSION" "версия в шапке"
+NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
+show_detected_interfaces > "$TEST_ROOT/interfaces"
+assert_contains "$TEST_ROOT/interfaces" 'Найденные WireGuard-интерфейсы:' "заголовок интерфейсов"
+assert_contains "$TEST_ROOT/interfaces" 'Wireguard0 — Удалённый офис' "найденный интерфейс"
+pass "шапка и список интерфейсов содержат нужную информацию"
+
+# Набор действий зависит от наличия настроенных заданий.
+MENU_ROOT="$TEST_ROOT/menu"
+mkdir -p "$MENU_ROOT/empty" "$MENU_ROOT/tmp"
+CONFIG_DIR="$MENU_ROOT/empty"
+TMP_DIR="$MENU_ROOT/tmp"
+printf '0\n' > "$MENU_ROOT/input-empty"
+INPUT_DEVICE="$MENU_ROOT/input-empty"
+OUTPUT_DEVICE="$MENU_ROOT/prompts-empty"
+open_console
+UPDATE_AVAILABLE=no
+main_menu > "$MENU_ROOT/menu-empty"
+assert_contains "$MENU_ROOT/menu-empty" '1) Добавить задание' "добавление без заданий"
+assert_contains "$MENU_ROOT/menu-empty" '2) Проверить обновления' "обновление без заданий"
+if grep -F 'Изменить задание' "$MENU_ROOT/menu-empty" >/dev/null; then
+    fail "без заданий показано полное меню"
+fi
+
+CONFIG_DIR="$MANAGER_ROOT/config"
+TMP_DIR="$MANAGER_ROOT/tmp"
+printf '0\n' > "$MENU_ROOT/input-full"
+INPUT_DEVICE="$MENU_ROOT/input-full"
+OUTPUT_DEVICE="$MENU_ROOT/prompts-full"
+open_console
+main_menu > "$MENU_ROOT/menu-full"
+assert_contains "$MENU_ROOT/menu-full" '2) Изменить задание' "полное меню"
+assert_contains "$MENU_ROOT/menu-full" '7) Проверить обновления' "обновление в полном меню"
+pass "меню сокращается, когда заданий ещё нет"
+
+# Установщик сразу передаёт управление менеджеру без повторного подтверждения.
+assert_contains "$INSTALLER" 'exec "$MANAGER_PATH" --from-installer' "флаг запуска из установщика"
+assert_contains "$MANAGER" '--from-installer|--after-update) SKIP_CONFIRM=yes' "пропуск подтверждения"
+pass "запуск по ссылке не задаёт предупреждающий вопрос"
 
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"
