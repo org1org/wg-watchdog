@@ -2,7 +2,7 @@
 
 # Interactive installer and job manager for WG Watchdog.
 
-VERSION="1.2.2"
+VERSION="1.2.3"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
 MANAGER_URL="$BASE_URL/install.sh"
@@ -27,6 +27,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
 TMP_FILES=""
+CONSOLE_OPEN=no
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     COLOR_GREEN=$(printf '\033[1;32m')
@@ -47,6 +48,16 @@ say() { printf '%s\n' "$*"; }
 info() { printf '\n%s%s%s\n\n' "$COLOR_GREEN" "$*" "$COLOR_RESET"; }
 die() { say "Ошибка: $*" >&2; exit 1; }
 
+open_console() {
+    if [ "$CONSOLE_OPEN" = "yes" ]; then
+        exec 3<&-
+        exec 4>&-
+    fi
+    exec 3< "$INPUT_DEVICE" || die "не удалось открыть ввод терминала"
+    exec 4> "$OUTPUT_DEVICE" || die "не удалось открыть вывод терминала"
+    CONSOLE_OPEN=yes
+}
+
 make_temp() {
     tmp_file="$TMP_DIR/wg-watchdog.$$.$1"
     TMP_FILES="$TMP_FILES $tmp_file"
@@ -58,18 +69,18 @@ read_answer() {
     prompt=$1
     default_value=${2:-}
     if [ -n "$default_value" ]; then
-        printf '%s [%s]: ' "$prompt" "$default_value" > "$OUTPUT_DEVICE"
+        printf '%s [%s]: ' "$prompt" "$default_value" >&4
     else
-        printf '%s: ' "$prompt" > "$OUTPUT_DEVICE"
+        printf '%s: ' "$prompt" >&4
     fi
-    IFS= read -r answer < "$INPUT_DEVICE" || die "не удалось прочитать ответ"
+    IFS= read -r answer <&3 || die "не удалось прочитать ответ"
     [ -n "$answer" ] || answer=$default_value
     REPLY=$answer
 }
 
 confirm() {
-    printf '%s [д/Н]: ' "$1" > "$OUTPUT_DEVICE"
-    IFS= read -r answer < "$INPUT_DEVICE" || die "не удалось прочитать ответ"
+    printf '%s [y/N]: ' "$1" >&4
+    IFS= read -r answer <&3 || die "не удалось прочитать ответ"
     case "$answer" in
         д|Д|да|Да|ДА|y|Y|yes|YES|Yes) return 0 ;;
         *) return 1 ;;
@@ -77,8 +88,8 @@ confirm() {
 }
 
 confirm_yes() {
-    printf '%s [Д/н]: ' "$1" > "$OUTPUT_DEVICE"
-    IFS= read -r answer < "$INPUT_DEVICE" || die "не удалось прочитать ответ"
+    printf '%s [Y/n]: ' "$1" >&4
+    IFS= read -r answer <&3 || die "не удалось прочитать ответ"
     case "$answer" in
         н|Н|нет|Нет|НЕТ|n|N|no|NO|No) return 1 ;;
         *) return 0 ;;
@@ -516,7 +527,7 @@ migrate_legacy_config() {
         ENABLED=yes
         write_config
         mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.migrated-v1.0.0"
-        say "Конфигурация v1.0.0 перенесена в формат v1.2.2."
+        say "Конфигурация v1.0.0 перенесена в формат v1.2.3."
     else
         say "Предупреждение: старую конфигурацию не удалось перенести автоматически."
     fi
@@ -583,7 +594,14 @@ configure_job() {
         old_enabled=yes
     fi
 
-    choose_interface "$old_interface"
+    if [ "$mode" = "edit" ]; then
+        detect_interfaces
+        WG_INTERFACE=$old_interface
+        interface_description "$WG_INTERFACE"
+        info "Редактируется задание для $WG_INTERFACE — $REPLY"
+    else
+        choose_interface ""
+    fi
     JOB_ID=$WG_INTERFACE
     if [ -f "$CONFIG_DIR/$JOB_ID.conf" ] && [ "$JOB_ID" != "$original_job" ]; then
         say "Для $JOB_ID уже существует задание. Используйте пункт «Изменить»."
@@ -594,11 +612,11 @@ configure_job() {
     if [ -z "$default_server" ] && [ -n "$DETECTED_TUNNEL_IP" ]; then
         default_server=$DETECTED_TUNNEL_IP
     fi
-    if [ -z "$default_public_ip" ] && [ -n "$DETECTED_PUBLIC_IP" ]; then
-        default_public_ip=$DETECTED_PUBLIC_IP
+    if [ -n "$DETECTED_TUNNEL_IP" ]; then
+        info "Внутренний адрес найден в Allowed IPs выбранного WireGuard-пира."
     fi
-    if [ -n "$DETECTED_TUNNEL_IP" ] || [ -n "$DETECTED_PUBLIC_IP" ]; then
-        info "Адреса подставлены из настроек выбранного WireGuard-пира."
+    if [ -n "$DETECTED_PUBLIC_IP" ]; then
+        say "В Endpoint выбранного пира найден публичный адрес: $DETECTED_PUBLIC_IP"
     fi
     if [ "$mode" = "add" ] && [ -z "$DETECTED_TUNNEL_IP" ]; then
         say "Внутренний адрес сервера не удалось определить автоматически."
@@ -624,16 +642,35 @@ configure_job() {
         confirm "Продолжить настройку?" || return 1
     fi
 
-    while :; do
-        read_answer "Публичный IP или DNS-имя WG-сервера; Enter — не проверять" "$default_public_ip"
-        if [ -z "$REPLY" ] || valid_address "$REPLY"; then
-            WG_SERVER_PUBLIC_IP=$REPLY
-            break
-        fi
-        say "Введите IP-адрес или имя хоста без пробелов либо оставьте поле пустым."
-    done
+    say ""
+    say "Необязательная проверка публичного адреса помогает отличить отключённый"
+    say "сервер от неисправного туннеля. Включайте её только если публичный адрес"
+    say "стабильно отвечает на ping: иначе watchdog может пропустить восстановление."
+    say ""
 
-    if [ -n "$WG_SERVER_PUBLIC_IP" ]; then
+    use_public_probe=no
+    suggested_public_ip=$DETECTED_PUBLIC_IP
+    if [ -n "$default_public_ip" ]; then
+        suggested_public_ip=$default_public_ip
+        say "Сейчас используется публичный адрес: $default_public_ip"
+        if confirm_yes "Продолжать проверять публичный адрес?"; then
+            use_public_probe=yes
+        fi
+    elif confirm "Использовать проверку публичного адреса?"; then
+        use_public_probe=yes
+    fi
+
+    WG_SERVER_PUBLIC_IP=""
+    if [ "$use_public_probe" = "yes" ]; then
+        while :; do
+            read_answer "Публичный IP или DNS-имя WG-сервера" "$suggested_public_ip"
+            if valid_address "$REPLY"; then
+                WG_SERVER_PUBLIC_IP=$REPLY
+                break
+            fi
+            say "Введите IP-адрес или имя хоста без пробелов."
+        done
+
         info "Проверяю публичный адрес $WG_SERVER_PUBLIC_IP..."
         if "$PING_BIN" -c 1 -W 3 "$WG_SERVER_PUBLIC_IP" >/dev/null 2>&1; then
             say "Публичный адрес WG-сервера отвечает."
@@ -686,9 +723,9 @@ build_job_index() {
         interface_description "$WG_INTERFACE"
         description=$REPLY
         if [ "$ENABLED" = "yes" ]; then state="включено"; else state="выключено"; fi
-        printf '  %s) %s — %s; сервер %s; каждые %s мин.; %s\n' \
-            "$count" "$WG_INTERFACE" "$description" "$WG_SERVER_TUNNEL_IP" \
-            "$CHECK_INTERVAL" "$state"
+        printf '  %s%s. %s — %s; сервер %s; каждые %s мин.; %s%s\n' \
+            "$COLOR_GREEN" "$count" "$WG_INTERFACE" "$description" \
+            "$WG_SERVER_TUNNEL_IP" "$CHECK_INTERVAL" "$state" "$COLOR_RESET"
     done
     JOB_COUNT=$count
 }
@@ -819,6 +856,7 @@ fi
 show_header
 [ -r "$INPUT_DEVICE" ] && [ -w "$OUTPUT_DEVICE" ] || \
     die "менеджер нужно запускать из интерактивного терминала"
+open_console
 if ! confirm_yes "Продолжить?"; then
     say "Настройка отменена."
     exit 0

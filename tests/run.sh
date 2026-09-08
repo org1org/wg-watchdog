@@ -293,6 +293,7 @@ pass "адреса сервера автоматически извлекают�
 printf '2\n' > "$TEST_ROOT/peer-answer"
 INPUT_DEVICE="$TEST_ROOT/peer-answer"
 OUTPUT_DEVICE="$TEST_ROOT/peer-prompt"
+open_console
 detect_peer_defaults Wireguard3 >/dev/null
 assert_equal "$DETECTED_PUBLIC_IP" "2001:db8::10" "IPv6 endpoint второго пира"
 assert_equal "$DETECTED_TUNNEL_IP" "10.3.0.10" "внутренний адрес второго пира"
@@ -302,11 +303,74 @@ pass "при нескольких пирах адреса берутся из в
 printf '\n' > "$TEST_ROOT/answer-yes"
 INPUT_DEVICE="$TEST_ROOT/answer-yes"
 OUTPUT_DEVICE="$TEST_ROOT/prompt"
+open_console
 confirm_yes "Продолжить" || fail "Enter не подтвердил продолжение"
+assert_contains "$OUTPUT_DEVICE" '[Y/n]' "обозначение подтверждения по умолчанию"
 printf 'н\n' > "$TEST_ROOT/answer-no"
 INPUT_DEVICE="$TEST_ROOT/answer-no"
+open_console
 if confirm_yes "Продолжить"; then fail "ответ 'н' не отменил продолжение"; fi
-pass "приветственное подтверждение использует Enter как «да»"
+printf '\n' > "$TEST_ROOT/answer-default-no"
+INPUT_DEVICE="$TEST_ROOT/answer-default-no"
+open_console
+if confirm "Использовать публичную проверку"; then
+    fail "Enter включил необязательную публичную проверку"
+fi
+assert_contains "$OUTPUT_DEVICE" '[y/N]' "обозначение необязательного подтверждения"
+printf 'yes\n' > "$TEST_ROOT/answer-explicit-yes"
+INPUT_DEVICE="$TEST_ROOT/answer-explicit-yes"
+open_console
+confirm "Использовать публичную проверку" || fail "ответ yes не принят"
+pass "подтверждения используют yes/no и безопасные значения по умолчанию"
+
+# Полный диалог создания задания: Enter оставляет публичную проверку выключенной.
+prepare_dialog_case() {
+    dialog_name=$1
+    DIALOG_ROOT="$TEST_ROOT/$dialog_name"
+    CONFIG_DIR="$DIALOG_ROOT/config"
+    STATE_DIR="$DIALOG_ROOT/state"
+    RUN_DIR="$DIALOG_ROOT/run"
+    TMP_DIR="$DIALOG_ROOT/tmp"
+    CRONTAB_PATH="$DIALOG_ROOT/crontab"
+    CRON_INIT=/bin/true
+    PIDOF_BIN=/bin/true
+    WATCHDOG_PATH=/opt/bin/wg-watchdog.sh
+    NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
+    PING_BIN="$SCRIPT_DIR/mocks/ping"
+    MOCK_DIR="$DIALOG_ROOT/mock"
+    MOCK_SCENARIO=healthy
+    export MOCK_DIR MOCK_SCENARIO
+    mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR" "$TMP_DIR" "$MOCK_DIR"
+    : > "$MOCK_DIR/ping.log"
+    INPUT_DEVICE="$DIALOG_ROOT/answers"
+    OUTPUT_DEVICE="$DIALOG_ROOT/prompts"
+}
+
+prepare_dialog_case manager-default-public-off
+printf '1\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+open_console
+configure_job add "" >/dev/null
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_TUNNEL_IP='10.0.0.1'" "автоподстановка внутреннего адреса"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP=''" "публичная проверка по умолчанию"
+pass "Enter не включает проверку публичного адреса"
+
+# Редактирование существующего задания не спрашивает интерфейс повторно.
+printf '\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+open_console
+configure_job edit Wireguard0 >/dev/null
+if grep -F 'Выберите номер интерфейса' "$OUTPUT_DEVICE" >/dev/null; then
+    fail "при редактировании повторно запрошен WireGuard-интерфейс"
+fi
+assert_contains "$OUTPUT_DEVICE" 'Введите внутренний IP-адрес WireGuard-сервера' "диалог редактирования"
+pass "редактирование сохраняет интерфейс без повторного выбора"
+
+# Явный yes включает проверку и предлагает Endpoint в качестве адреса.
+prepare_dialog_case manager-public-opt-in
+printf '1\n\ny\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+open_console
+configure_job add "" >/dev/null
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP='198.51.100.10'" "публичный Endpoint"
+pass "явный yes включает проверку найденного публичного адреса"
 
 # Обновление конфигурации v1.1 добавляет новые параметры и исправляет неточный cron-интервал.
 MANAGER_ROOT="$TEST_ROOT/manager"
@@ -375,6 +439,19 @@ if grep -F 'Wireguard9' "$CRONTAB_PATH" >/dev/null; then
 fi
 assert_contains "$CRONTAB_PATH.wg-watchdog.bak" 'Wireguard9' "резервная копия cron"
 pass "crontab сохраняет чужие строки и исключает отключённые задания"
+
+# Задания визуально отличаются от пунктов меню: зелёный цвет и номер с точкой.
+COLOR_GREEN='<GREEN>'
+COLOR_RESET='</GREEN>'
+NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
+build_job_index > "$MANAGER_ROOT/job-list"
+assert_contains "$MANAGER_ROOT/job-list" '<GREEN>1. Wireguard0' "формат номера задания"
+if grep -F '<GREEN>1) Wireguard0' "$MANAGER_ROOT/job-list" >/dev/null; then
+    fail "задание использует тот же формат номера, что и действие меню"
+fi
+COLOR_GREEN=''
+COLOR_RESET=''
+pass "задания отображаются зелёным и нумеруются с точкой"
 
 # Повторная сборка идентичного crontab не меняет файл и резервную копию.
 cron_inode_before=$(ls -i "$CRONTAB_PATH" | awk '{ print $1 }')
