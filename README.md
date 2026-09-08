@@ -28,7 +28,7 @@ Watchdog каждые пять минут проверяет доступнос�
 Подключитесь к Entware по SSH от `root` и выполните:
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/org1org/wg-watchdog/v1.0.0/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/org1org/wg-watchdog/main/install.sh | sh
 ```
 
 Установщик задаст необходимые вопросы на русском языке. Для числовых параметров достаточно нажать Enter, чтобы принять рекомендуемое значение.
