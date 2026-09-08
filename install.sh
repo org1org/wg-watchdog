@@ -2,16 +2,16 @@
 
 # Interactive installer and job manager for WG Watchdog.
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
 MANAGER_URL="$BASE_URL/install.sh"
 WATCHDOG_PATH="/opt/bin/wg-watchdog.sh"
 MANAGER_PATH="/opt/bin/wg-watchdog-manager"
 CONFIG_DIR="/opt/etc/wg-watchdog.d"
-STATE_DIR="/opt/var/lib/wg-watchdog"
-RUN_DIR="/opt/var/run"
-TMP_DIR="/opt/tmp"
+STATE_DIR="/tmp/wg-watchdog"
+RUN_DIR="/tmp/wg-watchdog"
+TMP_DIR="/tmp"
 LEGACY_CONFIG="/opt/etc/wg-watchdog.conf"
 CRONTAB_PATH="/opt/etc/crontab"
 CRON_INIT="/opt/etc/init.d/S10cron"
@@ -175,14 +175,22 @@ install_program_files() {
     make_temp manager
     tmp_manager=$REPLY
 
-    say "Обновляю файлы WG Watchdog до версии $VERSION..."
+    say "Проверяю файлы WG Watchdog версии $VERSION..."
     download_file "$WATCHDOG_URL" "$tmp_watchdog" || die "не удалось загрузить watchdog"
     download_file "$MANAGER_URL" "$tmp_manager" || die "не удалось загрузить менеджер"
     sh -n "$tmp_watchdog" || die "ошибка синтаксиса в загруженном watchdog"
     sh -n "$tmp_manager" || die "ошибка синтаксиса в загруженном менеджере"
     chmod 755 "$tmp_watchdog" "$tmp_manager" || die "не удалось установить права"
-    mv "$tmp_watchdog" "$WATCHDOG_PATH" || die "не удалось установить watchdog"
-    mv "$tmp_manager" "$MANAGER_PATH" || die "не удалось установить менеджер"
+    if [ -f "$WATCHDOG_PATH" ] && cmp -s "$tmp_watchdog" "$WATCHDOG_PATH"; then
+        rm -f "$tmp_watchdog"
+    else
+        mv "$tmp_watchdog" "$WATCHDOG_PATH" || die "не удалось установить watchdog"
+    fi
+    if [ -f "$MANAGER_PATH" ] && cmp -s "$tmp_manager" "$MANAGER_PATH"; then
+        rm -f "$tmp_manager"
+    else
+        mv "$tmp_manager" "$MANAGER_PATH" || die "не удалось установить менеджер"
+    fi
 }
 
 detect_interfaces() {
@@ -293,7 +301,19 @@ RECOVERY_CHECK_DELAY='$RECOVERY_CHECK_DELAY'
 ENABLED='$ENABLED'
 EOF
     chmod 600 "$tmp_config" || die "не удалось установить права на конфигурацию"
+    if [ -f "$destination" ] && cmp -s "$tmp_config" "$destination"; then
+        rm -f "$tmp_config"
+        return 0
+    fi
     mv "$tmp_config" "$destination" || die "не удалось сохранить $destination"
+}
+
+ensure_cron_running() {
+    if "$PIDOF_BIN" cron >/dev/null 2>&1; then
+        return 0
+    fi
+    "$CRON_INIT" start >/dev/null 2>&1 || die "не удалось запустить cron"
+    "$PIDOF_BIN" cron >/dev/null 2>&1 || die "процесс cron не запущен"
 }
 
 rewrite_crontab() {
@@ -303,7 +323,6 @@ rewrite_crontab() {
     new_file=$REPLY
 
     if [ -f "$CRONTAB_PATH" ]; then
-        cp "$CRONTAB_PATH" "$CRONTAB_PATH.wg-watchdog.bak" 2>/dev/null || true
         awk -v begin="$CRON_BEGIN" -v end="$CRON_END" '
             $0 == begin { managed = 1; next }
             $0 == end { managed = 0; next }
@@ -327,10 +346,35 @@ rewrite_crontab() {
     done
     printf '%s\n' "$CRON_END" >> "$new_file"
     chmod 600 "$new_file" || die "не удалось установить права на crontab"
+
+    if [ -f "$CRONTAB_PATH" ] && cmp -s "$new_file" "$CRONTAB_PATH"; then
+        rm -f "$new_file"
+        ensure_cron_running
+        return 0
+    fi
+
+    if [ -f "$CRONTAB_PATH" ]; then
+        cp "$CRONTAB_PATH" "$CRONTAB_PATH.wg-watchdog.bak" 2>/dev/null || true
+    fi
     mv "$new_file" "$CRONTAB_PATH" || die "не удалось сохранить crontab"
 
     "$CRON_INIT" restart >/dev/null 2>&1 || die "не удалось запустить cron"
     "$PIDOF_BIN" cron >/dev/null 2>&1 || die "процесс cron не запущен"
+}
+
+cleanup_legacy_state() {
+    legacy_state_dir="/opt/var/lib/wg-watchdog"
+    [ -d "$legacy_state_dir" ] || return 0
+    removed=no
+    for state_file in "$legacy_state_dir"/*.state; do
+        [ -f "$state_file" ] || continue
+        rm -f "$state_file"
+        removed=yes
+    done
+    rmdir "$legacy_state_dir" 2>/dev/null || true
+    if [ "$removed" = "yes" ]; then
+        say "Старые файлы состояния удалены из /opt: теперь состояние хранится в RAM."
+    fi
 }
 
 migrate_legacy_config() {
@@ -359,7 +403,7 @@ migrate_legacy_config() {
         ENABLED=yes
         write_config
         mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.migrated-v1.0.0"
-        say "Конфигурация v1.0.0 перенесена в формат v1.2.0."
+        say "Конфигурация v1.0.0 перенесена в формат v1.2.1."
     else
         say "Предупреждение: старую конфигурацию не удалось перенести автоматически."
     fi
@@ -646,6 +690,7 @@ fi
 
 show_header
 ensure_environment
+cleanup_legacy_state
 migrate_legacy_config
 upgrade_config_files
 install_program_files

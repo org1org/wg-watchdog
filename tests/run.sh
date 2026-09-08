@@ -172,6 +172,12 @@ assert_equal "$LAST_RESULT" "обычный интернет недоступе�
 assert_empty "$MOCK_DIR/ndmc.log" "без интернета restart не нужен"
 pass "отсутствие интернета корректно отделяется от ошибки WG"
 
+# Одинаковая длительная ошибка пишется в системный журнал только один раз.
+run_watchdog internet_down 5600 --force >/dev/null
+internet_log_count=$(grep -c 'интернет недоступен' "$MOCK_DIR/logger.log" || true)
+assert_equal "$internet_log_count" 1 "подавление повторного логирования"
+pass "повторяющееся состояние не засоряет системный журнал"
+
 # Недоступный публичный сервер блокирует restart.
 new_case
 write_config 10.0.0.1 public.example 1 yes
@@ -301,6 +307,13 @@ assert_contains "$CONFIG_DIR/Wireguard0.conf" "RESTART_COOLDOWN='30'" "мигр�
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "CHECK_INTERVAL='5'" "нормализация интервала"
 pass "конфигурация v1.1 автоматически обновляется до v1.2"
 
+# Повторный запуск миграции не перезаписывает неизменившийся файл на /opt.
+config_inode_before=$(ls -i "$CONFIG_DIR/Wireguard0.conf" | awk '{ print $1 }')
+upgrade_config_files >/dev/null
+config_inode_after=$(ls -i "$CONFIG_DIR/Wireguard0.conf" | awk '{ print $1 }')
+assert_equal "$config_inode_after" "$config_inode_before" "неизменившийся конфиг"
+pass "неизменившаяся конфигурация не перезаписывается"
+
 # Перестройка crontab сохраняет чужие строки и создаёт по строке на включённый интерфейс.
 cat > "$CRONTAB_PATH" <<EOF
 SHELL=/bin/sh
@@ -334,5 +347,20 @@ if grep -F 'Wireguard9' "$CRONTAB_PATH" >/dev/null; then
 fi
 assert_contains "$CRONTAB_PATH.wg-watchdog.bak" 'Wireguard9' "резервная копия cron"
 pass "crontab сохраняет чужие строки и исключает отключённые задания"
+
+# Повторная сборка идентичного crontab не меняет файл и резервную копию.
+cron_inode_before=$(ls -i "$CRONTAB_PATH" | awk '{ print $1 }')
+backup_inode_before=$(ls -i "$CRONTAB_PATH.wg-watchdog.bak" | awk '{ print $1 }')
+rewrite_crontab
+cron_inode_after=$(ls -i "$CRONTAB_PATH" | awk '{ print $1 }')
+backup_inode_after=$(ls -i "$CRONTAB_PATH.wg-watchdog.bak" | awk '{ print $1 }')
+assert_equal "$cron_inode_after" "$cron_inode_before" "неизменившийся crontab"
+assert_equal "$backup_inode_after" "$backup_inode_before" "неизменившаяся резервная копия"
+pass "неизменившийся crontab не записывается повторно"
+
+# Часто изменяемые файлы по умолчанию должны находиться в RAM, а не на /opt.
+assert_contains "$WATCHDOG" 'STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"' "RAM state dir"
+assert_contains "$WATCHDOG" 'RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"' "RAM lock dir"
+pass "состояние и блокировки по умолчанию размещены в RAM"
 
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"

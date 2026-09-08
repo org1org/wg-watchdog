@@ -2,10 +2,10 @@
 
 # WG Watchdog for KeeneticOS + Entware
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-/opt/etc/wg-watchdog.d}"
-STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/opt/var/lib/wg-watchdog}"
-RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/opt/var/run}"
+STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
+RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
 BOOT_ID_FILE="${WG_WATCHDOG_BOOT_ID_FILE:-/proc/sys/kernel/random/boot_id}"
 UPTIME_FILE="${WG_WATCHDOG_UPTIME_FILE:-/proc/uptime}"
 PING_BIN="${WG_WATCHDOG_PING:-ping}"
@@ -158,6 +158,16 @@ record_result() {
     save_state || log_message "[$JOB_ID] не удалось сохранить состояние"
 }
 
+record_transition() {
+    new_result=$1
+    transition_message=$2
+    previous_result=$LAST_RESULT
+    record_result "$new_result"
+    if [ "$previous_result" != "$new_result" ]; then
+        log_message "$transition_message"
+    fi
+}
+
 ping_target() {
     "$PING_BIN" -c "$1" -W "$PING_TIMEOUT" "$2" >/dev/null 2>&1
 }
@@ -239,24 +249,24 @@ load_state
 uptime_seconds=$(sed -n '1s/\..*//p' "$UPTIME_FILE" 2>/dev/null)
 if is_nonnegative_integer "$uptime_seconds" && [ "$uptime_seconds" -lt "$BOOT_GRACE" ]; then
     CONSECUTIVE_FAILURES=0
-    record_result "пауза после загрузки роутера"
-    log_message "[$JOB_ID] после загрузки прошло ${uptime_seconds}с — проверка отложена"
+    record_transition "пауза после загрузки роутера" \
+        "[$JOB_ID] после загрузки прошло ${uptime_seconds}с — проверка отложена"
     exit 0
 fi
 
 # Если обычный интернет недоступен, перезапуск туннеля не поможет.
 if ! ping_target 1 1.1.1.1 && ! ping_target 1 8.8.8.8; then
     CONSECUTIVE_FAILURES=0
-    record_result "обычный интернет недоступен"
-    log_message "[$JOB_ID] интернет недоступен — перезапуск $WG_INTERFACE пропущен"
+    record_transition "обычный интернет недоступен" \
+        "[$JOB_ID] интернет недоступен — перезапуск $WG_INTERFACE пропущен"
     exit 0
 fi
 
 # Необязательная проверка отличает отключённый сервер от зависшего туннеля.
 if [ -n "$WG_SERVER_PUBLIC_IP" ] && ! ping_target 1 "$WG_SERVER_PUBLIC_IP"; then
     CONSECUTIVE_FAILURES=0
-    record_result "публичный адрес WG-сервера недоступен"
-    log_message "[$JOB_ID] WG-сервер $WG_SERVER_PUBLIC_IP недоступен снаружи — перезапуск пропущен"
+    record_transition "публичный адрес WG-сервера недоступен" \
+        "[$JOB_ID] WG-сервер $WG_SERVER_PUBLIC_IP недоступен снаружи — перезапуск пропущен"
     exit 0
 fi
 
@@ -281,8 +291,8 @@ if [ "$NOW_EPOCH" -gt 0 ] && [ "$LAST_RESTART_EPOCH" -gt 0 ]; then
     if [ "$since_restart" -ge 0 ] && [ "$since_restart" -lt "$cooldown_seconds" ]; then
         remaining=$(((cooldown_seconds - since_restart + 59) / 60))
         CONSECUTIVE_FAILURES=$FAILURE_THRESHOLD
-        record_result "cooldown, осталось около $remaining мин."
-        log_message "[$JOB_ID] действует cooldown — следующий перезапуск не раньше чем через $remaining мин."
+        record_transition "cooldown после перезапуска" \
+            "[$JOB_ID] действует cooldown — следующий перезапуск не раньше чем через $remaining мин."
         exit 0
     fi
 fi
