@@ -1,0 +1,33 @@
+name: Release v1.0.0
+
+on:
+  push:
+    paths:
+      - .github/workflows/release-v1.0.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create v1.0.0 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "WG Watchdog v1.0.0" \
+              --notes-file - <<'EOF'
+          Первый стабильный выпуск WG Watchdog для KeeneticOS + Entware.
+
+          - Интерактивный выбор WireGuard-интерфейса с отображением описания.
+          - Проверка внутреннего адреса WG-сервера перед установкой.
+          - Настраиваемые PING_COUNT, PING_TIMEOUT и RESTART_DELAY.
+          - Автоматическая установка и настройка cron без дублирования задания.
+          - Защита от перезапуска туннеля при отсутствии обычного интернета.
+          - Запись результатов восстановления в системный журнал Keenetic.
+          EOF
