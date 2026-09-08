@@ -1,7 +1,7 @@
 #!/bin/sh
 
 VERSION="1.0.0"
-SCRIPT_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/v1.0.0/wg-watchdog.sh"
+SCRIPT_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main/wg-watchdog.sh"
 INSTALL_PATH="/opt/bin/wg-watchdog.sh"
 CONFIG_PATH="/opt/etc/wg-watchdog.conf"
 CRONTAB_PATH="/opt/etc/crontab"
