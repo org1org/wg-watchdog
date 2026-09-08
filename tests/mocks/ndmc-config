@@ -1,0 +1,14 @@
+#!/bin/sh
+
+cat <<'EOF'
+interface GigabitEthernet0
+ description "WAN"
+!
+interface Wireguard0
+ description "Удалённый офис"
+ security-level private
+!
+interface Wireguard2
+ security-level private
+!
+EOF

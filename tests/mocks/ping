@@ -1,0 +1,19 @@
+#!/bin/sh
+
+for argument in "$@"; do
+    target=$argument
+done
+printf '%s | %s\n' "${MOCK_SCENARIO:-healthy}" "$target" >> "$MOCK_DIR/ping.log"
+
+case "${MOCK_SCENARIO:-healthy}:$target" in
+    internet_down:1.1.1.1|internet_down:8.8.8.8) exit 1 ;;
+    public_down:public.example) exit 1 ;;
+    tunnel_down:10.0.0.1) exit 1 ;;
+    dns_failure:vpn.example.invalid) exit 1 ;;
+    ndmc_fail_down:10.0.0.1) exit 1 ;;
+    recover_after_restart:10.0.0.1)
+        [ -f "$MOCK_DIR/recovered" ] && exit 0
+        exit 1
+        ;;
+    *) exit 0 ;;
+esac

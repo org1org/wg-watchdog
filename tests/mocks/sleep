@@ -1,0 +1,4 @@
+#!/bin/sh
+
+printf '%s\n' "$*" >> "$MOCK_DIR/sleep.log"
+exit 0

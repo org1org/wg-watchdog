@@ -1,0 +1,8 @@
+#!/bin/sh
+
+printf '%s\n' "$*" >> "$MOCK_DIR/ndmc.log"
+case "${MOCK_SCENARIO:-}:$*" in
+    ndmc_fail_down:*down) exit 1 ;;
+    recover_after_restart:*up) : > "$MOCK_DIR/recovered" ;;
+esac
+exit 0

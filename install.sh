@@ -2,15 +2,22 @@
 
 # Interactive installer and job manager for WG Watchdog.
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
 MANAGER_URL="$BASE_URL/install.sh"
 WATCHDOG_PATH="/opt/bin/wg-watchdog.sh"
 MANAGER_PATH="/opt/bin/wg-watchdog-manager"
 CONFIG_DIR="/opt/etc/wg-watchdog.d"
+STATE_DIR="/opt/var/lib/wg-watchdog"
+RUN_DIR="/opt/var/run"
+TMP_DIR="/opt/tmp"
 LEGACY_CONFIG="/opt/etc/wg-watchdog.conf"
 CRONTAB_PATH="/opt/etc/crontab"
+CRON_INIT="/opt/etc/init.d/S10cron"
+NDMC_BIN="ndmc"
+PING_BIN="ping"
+PIDOF_BIN="pidof"
 CRON_BEGIN="# BEGIN WG-WATCHDOG — managed automatically"
 CRON_END="# END WG-WATCHDOG"
 TTY_DEVICE="${WG_WATCHDOG_TTY:-/dev/tty}"
@@ -30,7 +37,7 @@ say() { printf '%s\n' "$*"; }
 die() { say "Ошибка: $*" >&2; exit 1; }
 
 make_temp() {
-    tmp_file="/opt/tmp/wg-watchdog.$$.$1"
+    tmp_file="$TMP_DIR/wg-watchdog.$$.$1"
     TMP_FILES="$TMP_FILES $tmp_file"
     : > "$tmp_file" || die "не удалось создать временный файл $tmp_file"
     REPLY=$tmp_file
@@ -83,29 +90,47 @@ valid_address() {
     esac
 }
 
-ask_positive_integer() {
+ask_integer_range() {
     variable_name=$1
     prompt=$2
     default_value=$3
+    minimum=$4
+    maximum=$5
     while :; do
-        read_answer "$prompt" "$default_value"
-        if is_positive_integer "$REPLY"; then
+        read_answer "$prompt ($minimum–$maximum)" "$default_value"
+        if is_positive_integer "$REPLY" && [ "$REPLY" -ge "$minimum" ] && \
+           [ "$REPLY" -le "$maximum" ]; then
             eval "$variable_name=\$REPLY"
             return 0
         fi
-        say "Введите целое число больше нуля."
+        say "Введите целое число от $minimum до $maximum."
     done
 }
 
 ask_interval() {
     while :; do
-        read_answer "CHECK_INTERVAL — частота проверки в минутах (1–59)" "$1"
-        if is_positive_integer "$REPLY" && [ "$REPLY" -le 59 ]; then
+        read_answer "CHECK_INTERVAL — частота проверки в минутах (1,2,3,4,5,6,10,12,15,20,30,60)" "$1"
+        if valid_interval "$REPLY"; then
             CHECK_INTERVAL=$REPLY
             return 0
         fi
-        say "Введите целое число от 1 до 59."
+        say "Допустимые значения: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30 или 60."
     done
+}
+
+valid_interval() {
+    case "$1" in
+        1|2|3|4|5|6|10|12|15|20|30|60) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+cron_schedule() {
+    case "$1" in
+        1) REPLY='*' ;;
+        60) REPLY='0' ;;
+        *) REPLY="*/$1" ;;
+    esac
 }
 
 download_file() {
@@ -123,23 +148,23 @@ ensure_environment() {
     [ "$(id -u 2>/dev/null)" = "0" ] || die "запустите менеджер от пользователя root"
     [ -d /opt ] || die "каталог /opt отсутствует — сначала установите Entware"
     command -v opkg >/dev/null 2>&1 || die "команда opkg не найдена — Entware не запущен"
-    mkdir -p /opt/bin /opt/etc /opt/tmp /opt/var/run "$CONFIG_DIR" || \
+    mkdir -p /opt/bin /opt/etc "$TMP_DIR" "$RUN_DIR" "$CONFIG_DIR" "$STATE_DIR" || \
         die "не удалось создать рабочие каталоги"
 
-    if ! command -v ndmc >/dev/null 2>&1; then
+    if ! command -v "$NDMC_BIN" >/dev/null 2>&1; then
         say "Устанавливаю ndmq для управления KeeneticOS..."
         opkg update || die "не удалось обновить список пакетов Entware"
         opkg install ndmq || die "не удалось установить ndmq"
     fi
 
-    if [ ! -x /opt/etc/init.d/S10cron ]; then
+    if [ ! -x "$CRON_INIT" ]; then
         say "Устанавливаю cron..."
         opkg update || die "не удалось обновить список пакетов Entware"
         opkg install cron || die "не удалось установить cron"
     fi
 
-    if grep -q '^ENABLED=no' /opt/etc/init.d/S10cron 2>/dev/null; then
-        sed -i 's/^ENABLED=no/ENABLED=yes/' /opt/etc/init.d/S10cron || \
+    if grep -q '^ENABLED=no' "$CRON_INIT" 2>/dev/null; then
+        sed -i 's/^ENABLED=no/ENABLED=yes/' "$CRON_INIT" || \
             die "не удалось включить автозапуск cron"
     fi
 }
@@ -161,7 +186,7 @@ install_program_files() {
 }
 
 detect_interfaces() {
-    RUNNING_CONFIG=$(ndmc -c "show running-config" 2>/dev/null || true)
+    RUNNING_CONFIG=$("$NDMC_BIN" -c "show running-config" 2>/dev/null || true)
     INTERFACE_LIST=$(printf '%s\n' "$RUNNING_CONFIG" | awk '
         function output() {
             if (is_wg) {
@@ -237,6 +262,11 @@ load_config() {
     PING_TIMEOUT=""
     RESTART_DELAY=""
     CHECK_INTERVAL=""
+    WG_SERVER_PUBLIC_IP=""
+    FAILURE_THRESHOLD=""
+    RESTART_COOLDOWN=""
+    BOOT_GRACE=""
+    RECOVERY_CHECK_DELAY=""
     ENABLED=""
     # shellcheck disable=SC1090
     . "$config_file"
@@ -251,10 +281,15 @@ write_config() {
 JOB_ID='$JOB_ID'
 WG_INTERFACE='$WG_INTERFACE'
 WG_SERVER_TUNNEL_IP='$WG_SERVER_TUNNEL_IP'
+WG_SERVER_PUBLIC_IP='$WG_SERVER_PUBLIC_IP'
 PING_COUNT='$PING_COUNT'
 PING_TIMEOUT='$PING_TIMEOUT'
 RESTART_DELAY='$RESTART_DELAY'
 CHECK_INTERVAL='$CHECK_INTERVAL'
+FAILURE_THRESHOLD='$FAILURE_THRESHOLD'
+RESTART_COOLDOWN='$RESTART_COOLDOWN'
+BOOT_GRACE='$BOOT_GRACE'
+RECOVERY_CHECK_DELAY='$RECOVERY_CHECK_DELAY'
 ENABLED='$ENABLED'
 EOF
     chmod 600 "$tmp_config" || die "не удалось установить права на конфигурацию"
@@ -284,17 +319,18 @@ rewrite_crontab() {
         [ -f "$config_file" ] || continue
         load_config "$config_file"
         if [ "$ENABLED" = "yes" ] && valid_interface "$JOB_ID" && \
-           is_positive_integer "$CHECK_INTERVAL" && [ "$CHECK_INTERVAL" -le 59 ]; then
-            printf '*/%s * * * * root %s --job %s\n' \
-                "$CHECK_INTERVAL" "$WATCHDOG_PATH" "$JOB_ID" >> "$new_file"
+           valid_interval "$CHECK_INTERVAL"; then
+            cron_schedule "$CHECK_INTERVAL"
+            printf '%s * * * * root %s --job %s\n' \
+                "$REPLY" "$WATCHDOG_PATH" "$JOB_ID" >> "$new_file"
         fi
     done
     printf '%s\n' "$CRON_END" >> "$new_file"
     chmod 600 "$new_file" || die "не удалось установить права на crontab"
     mv "$new_file" "$CRONTAB_PATH" || die "не удалось сохранить crontab"
 
-    /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || die "не удалось запустить cron"
-    pidof cron >/dev/null 2>&1 || die "процесс cron не запущен"
+    "$CRON_INIT" restart >/dev/null 2>&1 || die "не удалось запустить cron"
+    "$PIDOF_BIN" cron >/dev/null 2>&1 || die "процесс cron не запущен"
 }
 
 migrate_legacy_config() {
@@ -315,13 +351,46 @@ migrate_legacy_config() {
     if valid_interface "$WG_INTERFACE" && valid_address "$WG_SERVER_TUNNEL_IP"; then
         JOB_ID=$WG_INTERFACE
         CHECK_INTERVAL=5
+        WG_SERVER_PUBLIC_IP=""
+        FAILURE_THRESHOLD=2
+        RESTART_COOLDOWN=30
+        BOOT_GRACE=180
+        RECOVERY_CHECK_DELAY=15
         ENABLED=yes
         write_config
         mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.migrated-v1.0.0"
-        say "Конфигурация v1.0.0 перенесена в формат v1.1.0."
+        say "Конфигурация v1.0.0 перенесена в формат v1.2.0."
     else
         say "Предупреждение: старую конфигурацию не удалось перенести автоматически."
     fi
+}
+
+upgrade_config_files() {
+    for config_file in "$CONFIG_DIR"/*.conf; do
+        [ -f "$config_file" ] || continue
+        load_config "$config_file"
+        valid_interface "$JOB_ID" || continue
+        [ "$WG_INTERFACE" = "$JOB_ID" ] || continue
+        valid_address "$WG_SERVER_TUNNEL_IP" || continue
+        is_positive_integer "$PING_COUNT" && [ "$PING_COUNT" -le 10 ] || PING_COUNT=3
+        is_positive_integer "$PING_TIMEOUT" && [ "$PING_TIMEOUT" -le 30 ] || PING_TIMEOUT=3
+        is_positive_integer "$RESTART_DELAY" && [ "$RESTART_DELAY" -le 60 ] || RESTART_DELAY=3
+        if ! valid_interval "$CHECK_INTERVAL"; then
+            say "Интервал задания $JOB_ID заменён на точные 5 минут."
+            CHECK_INTERVAL=5
+        fi
+        FAILURE_THRESHOLD=${FAILURE_THRESHOLD:-2}
+        RESTART_COOLDOWN=${RESTART_COOLDOWN:-30}
+        BOOT_GRACE=${BOOT_GRACE:-180}
+        RECOVERY_CHECK_DELAY=${RECOVERY_CHECK_DELAY:-15}
+        WG_SERVER_PUBLIC_IP=${WG_SERVER_PUBLIC_IP:-}
+        is_positive_integer "$FAILURE_THRESHOLD" && [ "$FAILURE_THRESHOLD" -le 10 ] || FAILURE_THRESHOLD=2
+        is_positive_integer "$RESTART_COOLDOWN" && [ "$RESTART_COOLDOWN" -le 1440 ] || RESTART_COOLDOWN=30
+        is_positive_integer "$BOOT_GRACE" && [ "$BOOT_GRACE" -le 3600 ] || BOOT_GRACE=180
+        is_positive_integer "$RECOVERY_CHECK_DELAY" && [ "$RECOVERY_CHECK_DELAY" -le 300 ] || RECOVERY_CHECK_DELAY=15
+        [ "$ENABLED" = "yes" ] || ENABLED=no
+        write_config
+    done
 }
 
 configure_job() {
@@ -336,6 +405,11 @@ configure_job() {
         default_ping_timeout=$PING_TIMEOUT
         default_restart_delay=$RESTART_DELAY
         default_interval=$CHECK_INTERVAL
+        default_public_ip=${WG_SERVER_PUBLIC_IP:-}
+        default_failure_threshold=${FAILURE_THRESHOLD:-2}
+        default_restart_cooldown=${RESTART_COOLDOWN:-30}
+        default_boot_grace=${BOOT_GRACE:-180}
+        default_recovery_delay=${RECOVERY_CHECK_DELAY:-15}
         old_enabled=$ENABLED
     else
         old_interface=""
@@ -344,6 +418,11 @@ configure_job() {
         default_ping_timeout=3
         default_restart_delay=3
         default_interval=5
+        default_public_ip=""
+        default_failure_threshold=2
+        default_restart_cooldown=30
+        default_boot_grace=180
+        default_recovery_delay=15
         old_enabled=yes
     fi
 
@@ -364,22 +443,48 @@ configure_job() {
     done
 
     say "Проверяю связь с $WG_SERVER_TUNNEL_IP..."
-    if ping -c 3 -W 3 "$WG_SERVER_TUNNEL_IP" >/dev/null 2>&1; then
+    if "$PING_BIN" -c 3 -W 3 "$WG_SERVER_TUNNEL_IP" >/dev/null 2>&1; then
         say "Сервер отвечает на ping."
     else
         say "Сервер не ответил. Возможно, туннель сейчас не работает или ICMP запрещён."
         confirm "Продолжить настройку?" || return 1
     fi
 
+    while :; do
+        read_answer "Публичный IP или DNS-имя WG-сервера; Enter — не проверять" "$default_public_ip"
+        if [ -z "$REPLY" ] || valid_address "$REPLY"; then
+            WG_SERVER_PUBLIC_IP=$REPLY
+            break
+        fi
+        say "Введите IP-адрес или имя хоста без пробелов либо оставьте поле пустым."
+    done
+
+    if [ -n "$WG_SERVER_PUBLIC_IP" ]; then
+        say "Проверяю публичный адрес $WG_SERVER_PUBLIC_IP..."
+        if "$PING_BIN" -c 1 -W 3 "$WG_SERVER_PUBLIC_IP" >/dev/null 2>&1; then
+            say "Публичный адрес WG-сервера отвечает."
+        else
+            say "Предупреждение: публичный адрес не ответил. Если ICMP на нём запрещён,"
+            say "лучше оставить это поле пустым, иначе watchdog будет пропускать восстановление."
+            confirm "Сохранить этот публичный адрес несмотря на отсутствие ответа?" || \
+                WG_SERVER_PUBLIC_IP=""
+        fi
+    fi
+
     say "Нажмите Enter, чтобы принять значение в скобках."
-    ask_positive_integer PING_COUNT "PING_COUNT — число ping-запросов при проверке" "$default_ping_count"
-    ask_positive_integer PING_TIMEOUT "PING_TIMEOUT — ожидание каждого ответа, секунд" "$default_ping_timeout"
-    ask_positive_integer RESTART_DELAY "RESTART_DELAY — пауза down/up интерфейса, секунд" "$default_restart_delay"
+    ask_integer_range PING_COUNT "PING_COUNT — число ping-запросов при проверке" "$default_ping_count" 1 10
+    ask_integer_range PING_TIMEOUT "PING_TIMEOUT — ожидание каждого ответа, секунд" "$default_ping_timeout" 1 30
+    ask_integer_range RESTART_DELAY "RESTART_DELAY — пауза down/up интерфейса, секунд" "$default_restart_delay" 1 60
     ask_interval "$default_interval"
+    ask_integer_range FAILURE_THRESHOLD "FAILURE_THRESHOLD — неудачных проверок до перезапуска" "$default_failure_threshold" 1 10
+    ask_integer_range RESTART_COOLDOWN "RESTART_COOLDOWN — пауза между перезапусками, минут" "$default_restart_cooldown" 1 1440
+    ask_integer_range BOOT_GRACE "BOOT_GRACE — ожидание после загрузки роутера, секунд" "$default_boot_grace" 1 3600
+    ask_integer_range RECOVERY_CHECK_DELAY "RECOVERY_CHECK_DELAY — ожидание проверки после перезапуска, секунд" "$default_recovery_delay" 1 300
     ENABLED=$old_enabled
 
     if [ -n "$original_job" ] && [ "$original_job" != "$JOB_ID" ]; then
-        rm -f "$CONFIG_DIR/$original_job.conf" "/opt/var/run/wg-watchdog-$original_job.pid"
+        rm -f "$CONFIG_DIR/$original_job.conf" "$STATE_DIR/$original_job.state" \
+            "$RUN_DIR/wg-watchdog-$original_job.pid"
     fi
     write_config
     saved_job=$JOB_ID
@@ -445,9 +550,41 @@ toggle_job() {
 delete_job() {
     select_job "Какое задание удалить" || return
     confirm "Удалить задание $SELECTED_JOB и его настройки?" || return
-    rm -f "$CONFIG_DIR/$SELECTED_JOB.conf" "/opt/var/run/wg-watchdog-$SELECTED_JOB.pid"
+    rm -f "$CONFIG_DIR/$SELECTED_JOB.conf" "$STATE_DIR/$SELECTED_JOB.state" \
+        "$RUN_DIR/wg-watchdog-$SELECTED_JOB.pid"
+    rm -f "$RUN_DIR/wg-watchdog-$SELECTED_JOB.lock/pid"
+    rmdir "$RUN_DIR/wg-watchdog-$SELECTED_JOB.lock" 2>/dev/null || true
     rewrite_crontab
     say "Задание $SELECTED_JOB удалено."
+}
+
+show_job_status() {
+    select_job "Какое задание показать" || return
+    load_config "$CONFIG_DIR/$SELECTED_JOB.conf"
+    state_file="$STATE_DIR/$SELECTED_JOB.state"
+    CONSECUTIVE_FAILURES=0
+    LAST_CHECK_TEXT="никогда"
+    LAST_SUCCESS_TEXT="никогда"
+    LAST_RESTART_TEXT="никогда"
+    LAST_RESULT="ещё не проверялось"
+    if [ -r "$state_file" ]; then
+        # Файл создаётся watchdog с правами 600.
+        # shellcheck disable=SC1090
+        . "$state_file"
+    fi
+    if [ "$ENABLED" = "yes" ]; then state="включено"; else state="выключено"; fi
+    say ""
+    say "Статус $SELECTED_JOB:"
+    say "  Состояние задания:        $state"
+    say "  Внутренний адрес сервера: $WG_SERVER_TUNNEL_IP"
+    say "  Публичный адрес сервера:  ${WG_SERVER_PUBLIC_IP:-не используется}"
+    say "  Частота проверки:         $CHECK_INTERVAL мин."
+    say "  Последний результат:      $LAST_RESULT"
+    say "  Последняя проверка:       $LAST_CHECK_TEXT"
+    say "  Последний успех:          $LAST_SUCCESS_TEXT"
+    say "  Последний перезапуск:     $LAST_RESTART_TEXT"
+    say "  Ошибок подряд:            $CONSECUTIVE_FAILURES из $FAILURE_THRESHOLD"
+    say "  Cooldown:                  $RESTART_COOLDOWN мин."
 }
 
 run_job_now() {
@@ -483,7 +620,8 @@ main_menu() {
         say "  2) Изменить задание"
         say "  3) Включить/выключить задание"
         say "  4) Запустить проверку сейчас"
-        say "  5) Удалить задание"
+        say "  5) Показать подробный статус"
+        say "  6) Удалить задание"
         say "  0) Выход"
         read_answer "Выберите действие" "0"
         case "$REPLY" in
@@ -494,16 +632,22 @@ main_menu() {
                 ;;
             3) [ "$JOB_COUNT" -gt 0 ] && toggle_job || say "Нет настроенных заданий." ;;
             4) [ "$JOB_COUNT" -gt 0 ] && run_job_now || say "Нет настроенных заданий." ;;
-            5) [ "$JOB_COUNT" -gt 0 ] && delete_job || say "Нет настроенных заданий." ;;
+            5) [ "$JOB_COUNT" -gt 0 ] && show_job_status || say "Нет настроенных заданий." ;;
+            6) [ "$JOB_COUNT" -gt 0 ] && delete_job || say "Нет настроенных заданий." ;;
             0) return 0 ;;
             *) say "Неизвестный пункт меню." ;;
         esac
     done
 }
 
+if [ "${WG_WATCHDOG_LIB_ONLY:-no}" = "yes" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 show_header
 ensure_environment
 migrate_legacy_config
+upgrade_config_files
 install_program_files
 rewrite_crontab
 
