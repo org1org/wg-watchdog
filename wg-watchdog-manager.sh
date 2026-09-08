@@ -30,6 +30,7 @@ PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
 TMP_FILES=""
+umask 077
 CONSOLE_OPEN=no
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -48,11 +49,15 @@ UPDATE_AVAILABLE=unknown
 REMOTE_VERSION=""
 
 cleanup() {
-    for file in $TMP_FILES; do
-        rm -f "$file"
+    printf '%s' "$TMP_FILES" | while IFS= read -r file; do
+        [ -n "$file" ] && rm -f "$file"
     done
+    TMP_FILES=""
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 say() { printf '%s\n' "$*"; }
 info() { printf '\n%s%s%s\n\n' "$COLOR_GREEN" "$*" "$COLOR_RESET"; }
@@ -69,9 +74,9 @@ open_console() {
 }
 
 make_temp() {
-    tmp_file="$TMP_DIR/wg-watchdog.$$.$1"
-    TMP_FILES="$TMP_FILES $tmp_file"
-    : > "$tmp_file" || die "не удалось создать временный файл $tmp_file"
+    tmp_file=$(mktemp "$TMP_DIR/wg-watchdog.$1.XXXXXX") || die "не удалось создать временный файл"
+    TMP_FILES="${TMP_FILES}${tmp_file}
+"
     REPLY=$tmp_file
 }
 
@@ -176,10 +181,10 @@ cron_schedule() {
 
 download_file() {
     if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1" && return 0
+        wget -q -T 10 -O "$2" "$1" && return 0
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" -o "$2" && return 0
+        curl -fsSL --connect-timeout 5 --max-time 20 "$1" -o "$2" && return 0
     fi
     return 1
 }
@@ -254,18 +259,14 @@ ensure_environment() {
     mkdir -p /opt/bin /opt/etc "$TMP_DIR" "$RUN_DIR" "$CONFIG_DIR" "$STATE_DIR" || \
         die "не удалось создать рабочие каталоги"
 
-    if ! command -v "$NDMC_BIN" >/dev/null 2>&1; then
-        info "Устанавливаю ndmq для управления KeeneticOS..."
+    missing_packages=""
+    command -v "$NDMC_BIN" >/dev/null 2>&1 || missing_packages="ndmq"
+    [ -x "$CRON_INIT" ] || missing_packages="$missing_packages cron"
+    if [ -n "$missing_packages" ]; then
+        info "Устанавливаю необходимые пакеты:$missing_packages"
         opkg update || die "не удалось обновить список пакетов Entware"
-        opkg install ndmq || die "не удалось установить ndmq"
-        say ""
-    fi
-
-    if [ ! -x "$CRON_INIT" ]; then
-        info "Устанавливаю cron..."
-        opkg update || die "не удалось обновить список пакетов Entware"
-        opkg install cron || die "не удалось установить cron"
-        say ""
+        # Only fixed package names assembled above, never user input.
+        opkg install $missing_packages || die "не удалось установить зависимости"
     fi
 
     if grep -q '^ENABLED=no' "$CRON_INIT" 2>/dev/null; then
@@ -312,6 +313,8 @@ show_update_notice() {
         printf '%s%s\n' "$COLOR_YELLOW" '=============================================='
         printf '  ДОСТУПНА НОВАЯ ВЕРСИЯ: %s → %s\n' "$VERSION" "$REMOTE_VERSION"
         printf '%s%s\n\n' '  Выберите обновление в основном меню.' "$COLOR_RESET"
+    elif [ "$UPDATE_AVAILABLE" = "unknown" ]; then
+        say "Обновления проверить не удалось; локальное управление доступно."
     fi
 }
 
@@ -330,6 +333,7 @@ perform_update() {
     confirm "Загрузить и установить обновление?" || return 0
     install_program_files
     info "Обновление установлено. Перезапускаю менеджер..."
+    cleanup
     exec "$MANAGER_PATH" --after-update
     die "не удалось запустить обновлённый менеджер"
 }
@@ -516,7 +520,7 @@ write_config() {
     make_temp config
     tmp_config=$REPLY
     cat > "$tmp_config" <<EOF
-# WG Watchdog $VERSION — управляется через wg-watchdog-manager
+# WG Watchdog — управляется через wgwm; формат конфигурации 1
 JOB_ID='$JOB_ID'
 WG_INTERFACE='$WG_INTERFACE'
 WG_SERVER_TUNNEL_IP='$WG_SERVER_TUNNEL_IP'
@@ -547,20 +551,29 @@ ensure_cron_running() {
     "$PIDOF_BIN" cron >/dev/null 2>&1 || die "процесс cron не запущен"
 }
 
-rewrite_crontab() {
+filter_managed_cron() {
+    # Fail closed on malformed markers; never consume unrelated entries.
+    awk -v begin="$CRON_BEGIN" -v end="$CRON_END" -v script="$WATCHDOG_PATH" '
+        $0 == begin { if (managed || seen++) bad = 1; managed = 1; next }
+        $0 == end { if (!managed) bad = 1; managed = 0; next }
+        managed { next }
+        $6 == "root" && ($7 == script || $7 == "/opt/bin/wg-watchdog.sh") { next }
+        { print }
+        END { if (managed || bad) exit 1 }
+    ' "$CRONTAB_PATH"
+}
+
+# A subshell isolates configuration variables from the selected job.
+rewrite_crontab() (
+    TMP_FILES=""
+    trap cleanup EXIT
     make_temp cron-clean
     clean_file=$REPLY
     make_temp cron-new
     new_file=$REPLY
 
     if [ -f "$CRONTAB_PATH" ]; then
-        awk -v begin="$CRON_BEGIN" -v end="$CRON_END" '
-            $0 == begin { managed = 1; next }
-            $0 == end { managed = 0; next }
-            managed { next }
-            /\/opt\/bin\/wg-watchdog\.sh/ { next }
-            { print }
-        ' "$CRONTAB_PATH" > "$clean_file" || die "не удалось прочитать crontab"
+        filter_managed_cron > "$clean_file" || die "повреждены границы блока WG Watchdog в crontab; файл не изменён"
     fi
 
     cat "$clean_file" > "$new_file" || die "не удалось подготовить crontab"
@@ -591,7 +604,7 @@ rewrite_crontab() {
 
     "$CRON_INIT" restart >/dev/null 2>&1 || die "не удалось запустить cron"
     "$PIDOF_BIN" cron >/dev/null 2>&1 || die "процесс cron не запущен"
-}
+)
 
 cleanup_legacy_state() {
     legacy_state_dir="/opt/var/lib/wg-watchdog"
@@ -715,7 +728,12 @@ configure_job() {
         return 1
     fi
 
-    detect_peer_defaults "$WG_INTERFACE"
+    if [ "$mode" = "add" ]; then
+        detect_peer_defaults "$WG_INTERFACE"
+    else
+        DETECTED_TUNNEL_IP=""
+        DETECTED_PUBLIC_IP=""
+    fi
     if [ -z "$default_server" ] && [ -n "$DETECTED_TUNNEL_IP" ]; then
         default_server=$DETECTED_TUNNEL_IP
     fi
@@ -811,14 +829,10 @@ configure_job() {
     fi
     ENABLED=$old_enabled
 
-    if [ -n "$original_job" ] && [ "$original_job" != "$JOB_ID" ]; then
-        rm -f "$CONFIG_DIR/$original_job.conf" "$STATE_DIR/$original_job.state" \
-            "$RUN_DIR/wg-watchdog-$original_job.pid"
-    fi
     write_config
     saved_job=$JOB_ID
     saved_enabled=$ENABLED
-    rewrite_crontab
+    rewrite_crontab || die "настройки сохранены, но cron не обновлён"
     if [ "$saved_enabled" = "yes" ]; then
         saved_state="включено"
     else
@@ -880,18 +894,18 @@ toggle_job() {
         action="включено"
     fi
     write_config
-    rewrite_crontab
+    rewrite_crontab || die "не удалось обновить cron"
     say "Задание $SELECTED_JOB $action."
 }
 
 delete_job() {
     select_job "Какое задание удалить" || return
-    confirm "Удалить задание $SELECTED_JOB и его настройки?" || return
+    confirm "Удалить задание $SELECTED_JOB и его настройки?" || return 0
     rm -f "$CONFIG_DIR/$SELECTED_JOB.conf" "$STATE_DIR/$SELECTED_JOB.state" \
         "$RUN_DIR/wg-watchdog-$SELECTED_JOB.pid"
     rm -f "$RUN_DIR/wg-watchdog-$SELECTED_JOB.lock/pid"
     rmdir "$RUN_DIR/wg-watchdog-$SELECTED_JOB.lock" 2>/dev/null || true
-    rewrite_crontab
+    rewrite_crontab || die "не удалось обновить cron"
     say "Задание $SELECTED_JOB удалено."
 }
 
@@ -940,13 +954,7 @@ remove_managed_cron() {
     [ -f "$CRONTAB_PATH" ] || return 0
     make_temp cron-uninstall
     clean_file=$REPLY
-    awk -v begin="$CRON_BEGIN" -v end="$CRON_END" '
-        $0 == begin { managed = 1; next }
-        $0 == end { managed = 0; next }
-        managed { next }
-        /\/opt\/bin\/wg-watchdog\.sh/ { next }
-        { print }
-    ' "$CRONTAB_PATH" > "$clean_file" || die "не удалось очистить crontab"
+    filter_managed_cron > "$clean_file" || die "повреждены границы блока WG Watchdog в crontab; удаление отменено"
     if cmp -s "$clean_file" "$CRONTAB_PATH"; then
         rm -f "$clean_file"
         return 0
@@ -1022,6 +1030,7 @@ show_update_menu_item() {
 
 main_menu() {
     while :; do
+        cleanup
         say ""
         say "Настроенные задания:"
         build_job_index
@@ -1057,13 +1066,12 @@ main_menu() {
         case "$REPLY" in
             1) configure_job add "" ;;
             2)
-                if [ "$JOB_COUNT" -eq 0 ]; then say "Нет заданий для изменения."
-                elif select_job "Какое задание изменить"; then configure_job edit "$SELECTED_JOB"; fi
+                if select_job "Какое задание изменить"; then configure_job edit "$SELECTED_JOB"; fi
                 ;;
-            3) [ "$JOB_COUNT" -gt 0 ] && toggle_job || say "Нет настроенных заданий." ;;
-            4) [ "$JOB_COUNT" -gt 0 ] && run_job_now || say "Нет настроенных заданий." ;;
-            5) [ "$JOB_COUNT" -gt 0 ] && show_job_status || say "Нет настроенных заданий." ;;
-            6) [ "$JOB_COUNT" -gt 0 ] && delete_job || say "Нет настроенных заданий." ;;
+            3) toggle_job ;;
+            4) run_job_now ;;
+            5) show_job_status ;;
+            6) delete_job ;;
             7) perform_update ;;
             8) uninstall_program ;;
             0) return 0 ;;
@@ -1091,12 +1099,12 @@ cleanup_legacy_state
 migrate_legacy_config
 upgrade_config_files
 ensure_short_command
-rewrite_crontab
+rewrite_crontab || exit 1
 
 check_update_status
 show_update_notice
 show_detected_interfaces
 
 main_menu
-say "Настройки сохранены. Для управления запустите: wgwm"
+say "Выход из WG Watchdog."
 exit 0

@@ -9,6 +9,7 @@ case "${MOCK_SCENARIO:-healthy}:$target" in
     internet_down:1.1.1.1|internet_down:8.8.8.8) exit 1 ;;
     public_down:public.example) exit 1 ;;
     tunnel_down:10.0.0.1) exit 1 ;;
+    terminate_during_restart:10.0.0.1) exit 1 ;;
     dns_failure:vpn.example.invalid) exit 1 ;;
     ndmc_fail_down:10.0.0.1) exit 1 ;;
     recover_after_restart:10.0.0.1)

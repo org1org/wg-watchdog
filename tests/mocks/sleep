@@ -1,4 +1,7 @@
 #!/bin/sh
 
 printf '%s\n' "$*" >> "$MOCK_DIR/sleep.log"
+if [ "${MOCK_SCENARIO:-}" = "terminate_during_restart" ]; then
+    kill -TERM "$PPID"
+fi
 exit 0

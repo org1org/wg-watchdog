@@ -671,4 +671,127 @@ assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашива�
 assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.4.0 установлен.' "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
+# Regression: cron generation must not replace the caller's selected job.
+(
+    TMP_FILES=""
+    trap cleanup EXIT
+    CONFIG_DIR="$MANAGER_ROOT/config"
+    CRONTAB_PATH="$MANAGER_ROOT/crontab"
+    TMP_DIR="$MANAGER_ROOT/tmp"
+    WATCHDOG_PATH=/opt/bin/wg-watchdog.sh
+    CRON_INIT=/bin/true
+    PIDOF_BIN=/bin/true
+    JOB_ID=Wireguard42
+    PING_COUNT=7
+    CHECK_INTERVAL=30
+    rewrite_crontab
+    assert_equal "$JOB_ID" Wireguard42 "выбранное задание после сборки cron"
+    assert_equal "$PING_COUNT" 7 "параметры выбранного задания"
+    assert_equal "$CHECK_INTERVAL" 30 "интервал выбранного задания"
+)
+pass "сборка cron не меняет переменные выбранного задания"
+
+# Regression: references to our script are not necessarily our commands.
+(
+    TMP_FILES=""
+    trap cleanup EXIT
+    TMP_DIR="$TEST_ROOT"
+    CRONTAB_PATH="$TEST_ROOT/cron-filter"
+    WATCHDOG_PATH=/opt/bin/wg-watchdog.sh
+    printf '%s\n' \
+        '# backup /opt/bin/wg-watchdog.sh' \
+        '1 * * * * root /opt/bin/backup /opt/bin/wg-watchdog.sh' \
+        '2 * * * * root /opt/bin/wg-watchdog.sh.backup' \
+        '3 * * * * root /opt/bin/wg-watchdog.sh --job Wireguard0' > "$CRONTAB_PATH"
+    filter_managed_cron > "$TEST_ROOT/cron-filter-result"
+    assert_equal "$(wc -l < "$TEST_ROOT/cron-filter-result" | tr -d ' ')" 3 "сохранение чужих упоминаний"
+    assert_contains "$TEST_ROOT/cron-filter-result" 'wg-watchdog.sh.backup' "похожая команда"
+    printf '%s\n' "$CRON_BEGIN" 'foreign entry' > "$CRONTAB_PATH"
+    cp "$CRONTAB_PATH" "$TEST_ROOT/cron-filter-original"
+    CONFIG_DIR="$MANAGER_ROOT/config"
+    if rewrite_crontab > /dev/null 2>&1; then fail "принят блок cron без END"; fi
+    cmp -s "$CRONTAB_PATH" "$TEST_ROOT/cron-filter-original" || fail "повреждённый cron перезаписан"
+)
+pass "очистка cron сохраняет чужие упоминания и отклоняет повреждённый блок"
+
+# Regression: tempfile names must be unique, private and work with spaces.
+(
+    TMP_FILES=""
+    trap cleanup EXIT
+    TMP_DIR="$TEST_ROOT/temp with spaces"
+    mkdir -p "$TMP_DIR"
+    make_temp config
+    first_temp=$REPLY
+    make_temp config
+    second_temp=$REPLY
+    [ "$first_temp" != "$second_temp" ] || fail "повторно использовано имя временного файла"
+    assert_equal "$(stat -c %a "$first_temp")" 600 "права временного файла"
+    cleanup
+    [ ! -e "$first_temp" ] && [ ! -e "$second_temp" ] || fail "временные файлы не удалены"
+)
+pass "временные файлы уникальны, закрыты и корректно очищаются"
+
+# Regression: canceling deletion is not an empty job list.
+(
+    TMP_FILES=""
+    trap cleanup EXIT
+    prepare_dialog_case cancel-delete
+    printf '1\n\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job add "" >/dev/null
+    printf '6\n1\nn\n0\n' > "$INPUT_DEVICE"
+    open_console
+    main_menu > "$DIALOG_ROOT/cancel-output"
+    [ -f "$CONFIG_DIR/Wireguard0.conf" ] || fail "отмена удалила задание"
+    if grep -F 'Нет настроенных заданий.' "$DIALOG_ROOT/cancel-output" >/dev/null; then
+        fail "отмена вызвала ложное сообщение об отсутствии заданий"
+    fi
+)
+pass "отмена удаления не выводит ложное сообщение"
+
+# Regression: editing a multi-peer interface does not reselect the peer.
+(
+    TMP_FILES=""
+    trap cleanup EXIT
+    prepare_dialog_case edit-multi-peer
+    printf '1\n\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job add "" >/dev/null
+    load_config "$CONFIG_DIR/Wireguard0.conf"
+    JOB_ID=Wireguard3
+    WG_INTERFACE=Wireguard3
+    write_config
+    printf '\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job edit Wireguard3 > "$DIALOG_ROOT/edit-output"
+    if grep -F 'Выберите пир' "$OUTPUT_DEVICE" >/dev/null; then fail "повторный выбор пира при редактировании"; fi
+    assert_contains "$CONFIG_DIR/Wireguard3.conf" "WG_SERVER_TUNNEL_IP='10.0.0.1'" "сохранённый адрес"
+)
+pass "редактирование многопирового интерфейса сохраняет адрес без выбора пира"
+
+# Regression: --force on an empty installation never asks for confirmation.
+(
+    INSTALL_OPT="$INSTALL_ROOT/fresh-force"
+    mkdir -p "$INSTALL_OPT"
+    : > "$INSTALL_ROOT/answer"
+    : > "$INSTALL_ROOT/prompt"
+    installer_env --force > "$INSTALL_ROOT/fresh-force-output"
+    assert_empty "$INSTALL_ROOT/prompt" "подтверждение --force на чистой системе"
+)
+pass "--force работает и на чистой системе без вопроса"
+
+# Regression: TERM between down/up must attempt up and stop execution.
+new_case
+load_config "$MANAGER_ROOT/config/Wireguard0.conf"
+FAILURE_THRESHOLD=1
+write_config
+signal_result=0
+run_watchdog terminate_during_restart 15000 --force > "$CASE_DIR/result" || signal_result=$?
+assert_equal "$signal_result" 143 "код завершения TERM"
+assert_contains "$MOCK_DIR/ndmc.log" 'interface Wireguard0 down' "выключение до TERM"
+assert_contains "$MOCK_DIR/ndmc.log" 'interface Wireguard0 up' "аварийное включение после TERM"
+assert_equal "$(wc -l < "$MOCK_DIR/sleep.log" | tr -d ' ')" 1 "отсутствие продолжения после TERM"
+[ ! -d "$RUN_DIR/wg-watchdog-Wireguard0.lock" ] || fail "блокировка осталась после TERM"
+pass "TERM завершает watchdog и пытается вернуть интерфейс в up"
+
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"

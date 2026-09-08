@@ -17,6 +17,8 @@ export PATH
 
 FORCE=no
 LOCK_ACQUIRED=no
+INTERFACE_NEEDS_UP=no
+umask 077
 STATE_TMP=""
 
 say() {
@@ -70,6 +72,13 @@ release_lock() {
 }
 
 cleanup() {
+    if [ "$INTERFACE_NEEDS_UP" = "yes" ]; then
+        if "$NDMC_BIN" -c "interface $WG_INTERFACE up" >/dev/null 2>&1; then
+            INTERFACE_NEEDS_UP=no
+        else
+            log_message "[$JOB_ID] аварийное включение $WG_INTERFACE не удалось; требуется проверка вручную"
+        fi
+    fi
     [ -n "$STATE_TMP" ] && rm -f "$STATE_TMP"
     release_lock
 }
@@ -238,7 +247,10 @@ case "$lock_result" in
     2) exit 0 ;;
     *) log_message "[$JOB_ID] не удалось создать блокировку"; exit 1 ;;
 esac
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 CURRENT_BOOT_ID=$(sed -n '1p' "$BOOT_ID_FILE" 2>/dev/null)
 [ -n "$CURRENT_BOOT_ID" ] || CURRENT_BOOT_ID="unknown"
@@ -303,6 +315,7 @@ CONSECUTIVE_FAILURES=$FAILURE_THRESHOLD
 record_result "перезапуск интерфейса"
 log_message "[$JOB_ID] $WG_SERVER_TUNNEL_IP недоступен — перезапускаю $WG_INTERFACE"
 
+INTERFACE_NEEDS_UP=yes
 if ! "$NDMC_BIN" -c "interface $WG_INTERFACE down" >/dev/null 2>&1; then
     record_result "ошибка выключения интерфейса"
     log_message "[$JOB_ID] не удалось выключить $WG_INTERFACE"
@@ -317,6 +330,7 @@ if ! "$NDMC_BIN" -c "interface $WG_INTERFACE up" >/dev/null 2>&1; then
     exit 1
 fi
 
+INTERFACE_NEEDS_UP=no
 "$SLEEP_BIN" "$RECOVERY_CHECK_DELAY"
 if ping_target "$PING_COUNT" "$WG_SERVER_TUNNEL_IP"; then
     CONSECUTIVE_FAILURES=0

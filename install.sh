@@ -19,14 +19,19 @@ PATH="${WG_WATCHDOG_INSTALL_PATH:-$OPT_ROOT/bin:$OPT_ROOT/sbin:/usr/sbin:/usr/bi
 export PATH
 
 TMP_FILES=""
+umask 077
 FORCE_INSTALL=no
 
 cleanup() {
-    for file in $TMP_FILES; do
-        rm -f "$file"
+    printf '%s' "$TMP_FILES" | while IFS= read -r file; do
+        [ -n "$file" ] && rm -f "$file"
     done
+    TMP_FILES=""
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 say() { printf '%s\n' "$*"; }
 die() { say "Ошибка: $*" >&2; exit 1; }
@@ -41,18 +46,18 @@ confirm_yes() {
 }
 
 make_temp() {
-    tmp_file="$TMP_DIR/wg-watchdog-install.$$.$1"
-    TMP_FILES="$TMP_FILES $tmp_file"
-    : > "$tmp_file" || die "не удалось создать временный файл $tmp_file"
+    tmp_file=$(mktemp "$TMP_DIR/wg-watchdog.$1.XXXXXX") || die "не удалось создать временный файл"
+    TMP_FILES="${TMP_FILES}${tmp_file}
+"
     REPLY=$tmp_file
 }
 
 download_file() {
     if command -v wget >/dev/null 2>&1; then
-        wget -q -O "$2" "$1" && return 0
+        wget -q -T 10 -O "$2" "$1" && return 0
     fi
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$1" -o "$2" && return 0
+        curl -fsSL --connect-timeout 5 --max-time 20 "$1" -o "$2" && return 0
     fi
     return 1
 }
@@ -140,7 +145,6 @@ mkdir -p "$OPT_ROOT/bin" "$TMP_DIR" || die "не удалось подготов
 # восстанавливает короткую команду при необходимости и открывает менеджер.
 if [ "$FORCE_INSTALL" != "yes" ] && [ -x "$MANAGER_PATH" ] && [ -x "$WATCHDOG_PATH" ] && \
    grep -q '^VERSION_URL=' "$MANAGER_PATH" 2>/dev/null; then
-    ensure_short_command
     exec "$MANAGER_PATH"
     die "не удалось запустить установленный менеджер"
 fi
@@ -149,7 +153,7 @@ FIRST_INSTALL=no
 if [ ! -e "$MANAGER_PATH" ] && [ ! -e "$WATCHDOG_PATH" ]; then
     FIRST_INSTALL=yes
 fi
-if [ "$FIRST_INSTALL" = "yes" ]; then
+if [ "$FIRST_INSTALL" = "yes" ] && [ "$FORCE_INSTALL" != "yes" ]; then
     say "WG Watchdog контролирует доступность WG-сервера и перезапускает"
     say "зависший WireGuard-интерфейс по заданным правилам."
     confirm_yes "Установить WG Watchdog?" || {
