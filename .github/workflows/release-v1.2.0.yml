@@ -1,0 +1,31 @@
+name: Release v1.2.0
+
+on:
+  push:
+    paths:
+      - .github/workflows/release-v1.2.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create tag and release v1.2.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: bd42d4d78f42456d473fd91ddc361399d09a26e0
+          RELEASE_NOTES: >-
+            Этап надёжности: порог последовательных ошибок, cooldown между
+            перезапусками, пауза после загрузки, необязательная проверка
+            публичного адреса сервера, подробный статус заданий, точные
+            интервалы cron, безопасные пределы параметров и автоматическая
+            миграция с предыдущих версий. Добавлен mock-стенд из 17
+            автоматических сценариев.
+        run: |
+          gh release create v1.2.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "WG Watchdog v1.2.0" \
+            --notes "$RELEASE_NOTES"
