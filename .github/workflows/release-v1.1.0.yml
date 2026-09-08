@@ -1,0 +1,24 @@
+name: Release v1.1.0
+
+on:
+  push:
+    paths:
+      - .github/workflows/release-v1.1.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create tag and release v1.1.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: 3c1cf57fa2b6d9fa081ee0eb97699989527ddae1
+        run: |
+          gh release create v1.1.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET_SHA" \
+            --title "WG Watchdog v1.1.0" \
+            --notes "Менеджер нескольких WireGuard watchdog-заданий: добавление, изменение, включение, выключение и удаление заданий для разных интерфейсов; настраиваемая частота проверки; ручной запуск; миграция с v1.0.0; резервное копирование crontab и защита от параллельных запусков."
