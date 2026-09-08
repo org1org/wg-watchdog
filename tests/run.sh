@@ -349,12 +349,21 @@ prepare_dialog_case() {
 }
 
 prepare_dialog_case manager-default-public-off
-printf '1\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+printf '1\n\n\n' > "$INPUT_DEVICE"
 open_console
-configure_job add "" >/dev/null
+configure_job add "" > "$DIALOG_ROOT/output"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_TUNNEL_IP='10.0.0.1'" "автоподстановка внутреннего адреса"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP=''" "публичная проверка по умолчанию"
-pass "Enter не включает проверку публичного адреса"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "PING_COUNT='3'" "PING_COUNT по умолчанию"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "CHECK_INTERVAL='5'" "CHECK_INTERVAL по умолчанию"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "порог по умолчанию"
+if grep -F 'PING_COUNT —' "$OUTPUT_DEVICE" >/dev/null || \
+   grep -F 'CHECK_INTERVAL —' "$OUTPUT_DEVICE" >/dev/null; then
+    fail "при создании задания запрошены числовые параметры"
+fi
+assert_contains "$DIALOG_ROOT/output" 'Применены рекомендуемые параметры:' "summary параметров задания"
+assert_contains "$DIALOG_ROOT/output" 'Изменить эти значения можно' "подсказка редактирования"
+pass "новое задание получает рекомендуемые параметры без лишних вопросов"
 
 # Редактирование существующего задания не спрашивает интерфейс повторно.
 printf '\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
@@ -368,7 +377,7 @@ pass "редактирование сохраняет интерфейс без 
 
 # Явный yes включает проверку и предлагает Endpoint в качестве адреса.
 prepare_dialog_case manager-public-opt-in
-printf '1\n\ny\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+printf '1\n\ny\n\n' > "$INPUT_DEVICE"
 open_console
 configure_job add "" >/dev/null
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP='198.51.100.10'" "публичный Endpoint"
@@ -483,12 +492,12 @@ pass "версии распространяемых файлов совпада�
 # Семантическое сравнение и загрузка небольшого файла VERSION.
 version_is_newer 1.10.0 1.9.9 || fail "1.10.0 не распознана как новая версия"
 if version_is_newer 1.2.9 1.3.0; then fail "старая версия распознана как новая"; fi
-printf '1.4.0\n' > "$TEST_ROOT/remote-version"
+printf '1.5.0\n' > "$TEST_ROOT/remote-version"
 VERSION_URL="$TEST_ROOT/remote-version"
 download_file() { cp "$1" "$2"; }
 check_update_status
 assert_equal "$UPDATE_AVAILABLE" yes "доступность обновления"
-assert_equal "$REMOTE_VERSION" 1.4.0 "номер удалённой версии"
+assert_equal "$REMOTE_VERSION" 1.5.0 "номер удалённой версии"
 pass "проверка обновлений использует корректное сравнение версий"
 
 # Короткая команда создаётся только в свободном месте и не затирает коллизию.
@@ -532,6 +541,7 @@ UPDATE_AVAILABLE=no
 main_menu > "$MENU_ROOT/menu-empty"
 assert_contains "$MENU_ROOT/menu-empty" '1) Добавить задание' "добавление без заданий"
 assert_contains "$MENU_ROOT/menu-empty" '2) Проверить обновления' "обновление без заданий"
+assert_contains "$MENU_ROOT/menu-empty" '3) Удалить WG Watchdog' "удаление без заданий"
 if grep -F 'Изменить задание' "$MENU_ROOT/menu-empty" >/dev/null; then
     fail "без заданий показано полное меню"
 fi
@@ -545,11 +555,120 @@ open_console
 main_menu > "$MENU_ROOT/menu-full"
 assert_contains "$MENU_ROOT/menu-full" '2) Изменить задание' "полное меню"
 assert_contains "$MENU_ROOT/menu-full" '7) Проверить обновления' "обновление в полном меню"
+assert_contains "$MENU_ROOT/menu-full" '8) Удалить WG Watchdog' "удаление в полном меню"
 pass "меню сокращается, когда заданий ещё нет"
 
-# Установщик сразу передаёт управление менеджеру без повторного подтверждения.
-assert_contains "$INSTALLER" 'exec "$MANAGER_PATH" --from-installer' "флаг запуска из установщика"
-assert_contains "$MANAGER" '--from-installer|--after-update) SKIP_CONFIRM=yes' "пропуск подтверждения"
-pass "запуск по ссылке не задаёт предупреждающий вопрос"
+# Менеджер запускается без лишнего подтверждения, а установщик не стартует его после первой установки.
+if grep -F 'confirm_yes "Продолжить?' "$MANAGER" >/dev/null; then
+    fail "wgwm всё ещё спрашивает подтверждение запуска"
+fi
+assert_contains "$INSTALLER" 'confirm_yes "Установить WG Watchdog?"' "подтверждение первой установки"
+assert_contains "$INSTALLER" 'show_summary' "итог первой установки"
+pass "подтверждение осталось только у первой установки"
+
+# Полное удаление убирает только файлы программы и её блок cron.
+UNINSTALL_ROOT="$TEST_ROOT/uninstall"
+CONFIG_DIR="$UNINSTALL_ROOT/config"
+STATE_DIR="$UNINSTALL_ROOT/state"
+RUN_DIR="$UNINSTALL_ROOT/state"
+TMP_DIR="$UNINSTALL_ROOT/tmp"
+CRONTAB_PATH="$UNINSTALL_ROOT/crontab"
+CRON_INIT=/bin/true
+WATCHDOG_PATH="$UNINSTALL_ROOT/bin/wg-watchdog.sh"
+MANAGER_PATH="$UNINSTALL_ROOT/bin/wg-watchdog-manager"
+SHORT_COMMAND="$UNINSTALL_ROOT/bin/wgwm"
+mkdir -p "$CONFIG_DIR" "$STATE_DIR/wg-watchdog-Wireguard0.lock" "$TMP_DIR" "$UNINSTALL_ROOT/bin"
+: > "$CONFIG_DIR/Wireguard0.conf"
+: > "$STATE_DIR/Wireguard0.state"
+: > "$STATE_DIR/wg-watchdog-Wireguard0.lock/pid"
+: > "$WATCHDOG_PATH"
+: > "$MANAGER_PATH"
+ln -s "$MANAGER_PATH" "$SHORT_COMMAND"
+cat > "$CRONTAB_PATH" <<EOF
+17 * * * * root /opt/bin/foreign-task
+$CRON_BEGIN
+*/5 * * * * root /opt/bin/wg-watchdog.sh --job Wireguard0
+$CRON_END
+EOF
+printf 'yes\n' > "$UNINSTALL_ROOT/answer"
+INPUT_DEVICE="$UNINSTALL_ROOT/answer"
+OUTPUT_DEVICE="$UNINSTALL_ROOT/prompt"
+open_console
+(uninstall_program > "$UNINSTALL_ROOT/output")
+[ ! -e "$WATCHDOG_PATH" ] || fail "watchdog остался после удаления"
+[ ! -e "$MANAGER_PATH" ] || fail "менеджер остался после удаления"
+[ ! -e "$SHORT_COMMAND" ] || fail "wgwm осталась после удаления"
+[ ! -e "$CONFIG_DIR/Wireguard0.conf" ] || fail "конфигурация осталась после удаления"
+assert_contains "$CRONTAB_PATH" '/opt/bin/foreign-task' "сохранение стороннего cron при удалении"
+if grep -F 'wg-watchdog.sh' "$CRONTAB_PATH" >/dev/null; then
+    fail "строка watchdog осталась в cron после удаления"
+fi
+pass "штатное удаление сохраняет сторонние задания cron"
+
+# Жизненный цикл установщика: первая установка, повторный запуск и --force.
+INSTALL_ROOT="$TEST_ROOT/installer"
+INSTALL_OPT="$INSTALL_ROOT/opt"
+INSTALL_TMP="$INSTALL_ROOT/tmp"
+INSTALL_MOCK_BIN="$INSTALL_ROOT/mock-bin"
+mkdir -p "$INSTALL_OPT/bin" "$INSTALL_TMP" "$INSTALL_MOCK_BIN"
+cat > "$INSTALL_MOCK_BIN/id" <<'EOF'
+#!/bin/sh
+printf '0\n'
+EOF
+cat > "$INSTALL_MOCK_BIN/wget" <<'EOF'
+#!/bin/sh
+output=""
+url=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -O) output=$2; shift 2 ;;
+        -q) shift ;;
+        *) url=$1; shift ;;
+    esac
+done
+cp "$MOCK_INSTALL_SOURCE/${url##*/}" "$output"
+EOF
+chmod 755 "$INSTALL_MOCK_BIN/id" "$INSTALL_MOCK_BIN/wget"
+printf '\n' > "$INSTALL_ROOT/answer"
+: > "$INSTALL_ROOT/prompt"
+installer_env() {
+    MOCK_INSTALL_SOURCE="$REPO_DIR" \
+    WG_WATCHDOG_OPT_ROOT="$INSTALL_OPT" \
+    WG_WATCHDOG_TMP_DIR="$INSTALL_TMP" \
+    WG_WATCHDOG_INPUT="$INSTALL_ROOT/answer" \
+    WG_WATCHDOG_OUTPUT="$INSTALL_ROOT/prompt" \
+    WG_WATCHDOG_OPKG=/bin/true \
+    WG_WATCHDOG_INSTALL_PATH="$INSTALL_MOCK_BIN:/usr/bin:/bin" \
+        sh "$INSTALLER" "$@"
+}
+installer_env > "$INSTALL_ROOT/first-output"
+assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
+assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.4.0 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
+[ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
+[ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
+pass "первая установка завершается summary без автозапуска"
+
+cat > "$INSTALL_OPT/bin/wg-watchdog-manager" <<'EOF'
+#!/bin/sh
+VERSION_URL=test
+printf 'launched\n' > "$MOCK_MANAGER_LOG"
+EOF
+chmod 755 "$INSTALL_OPT/bin/wg-watchdog-manager"
+MOCK_MANAGER_LOG="$INSTALL_ROOT/manager-launched"
+export MOCK_MANAGER_LOG
+installer_env > "$INSTALL_ROOT/repeat-output"
+assert_contains "$MOCK_MANAGER_LOG" launched "повторный запуск менеджера"
+if grep -F 'Загружаю WG Watchdog' "$INSTALL_ROOT/repeat-output" >/dev/null; then
+    fail "повторный запуск без --force загрузил файлы"
+fi
+pass "повторная установочная команда только запускает менеджер"
+
+: > "$INSTALL_ROOT/prompt"
+installer_env --force > "$INSTALL_ROOT/force-output"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.4.0"' "принудительная переустановка менеджера"
+assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
+assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.4.0 установлен.' "summary --force"
+pass "ключ --force принудительно переустанавливает файлы"
 
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"

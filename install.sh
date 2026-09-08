@@ -2,18 +2,24 @@
 
 # Compact bootstrap installer for WG Watchdog.
 
-VERSION="1.3.0"
-BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
+VERSION="1.4.0"
+BASE_URL="${WG_WATCHDOG_BASE_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog/main}"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
 MANAGER_URL="$BASE_URL/wg-watchdog-manager.sh"
-WATCHDOG_PATH="/opt/bin/wg-watchdog.sh"
-MANAGER_PATH="/opt/bin/wg-watchdog-manager"
-SHORT_COMMAND="/opt/bin/wgwm"
-TMP_DIR="/tmp"
-PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+OPT_ROOT="${WG_WATCHDOG_OPT_ROOT:-/opt}"
+WATCHDOG_PATH="${WG_WATCHDOG_INSTALL_WATCHDOG:-$OPT_ROOT/bin/wg-watchdog.sh}"
+MANAGER_PATH="${WG_WATCHDOG_INSTALL_MANAGER:-$OPT_ROOT/bin/wg-watchdog-manager}"
+SHORT_COMMAND="${WG_WATCHDOG_INSTALL_SHORT_COMMAND:-$OPT_ROOT/bin/wgwm}"
+TMP_DIR="${WG_WATCHDOG_TMP_DIR:-/tmp}"
+TTY_DEVICE="${WG_WATCHDOG_TTY:-/dev/tty}"
+INPUT_DEVICE="${WG_WATCHDOG_INPUT:-$TTY_DEVICE}"
+OUTPUT_DEVICE="${WG_WATCHDOG_OUTPUT:-$TTY_DEVICE}"
+OPKG_BIN="${WG_WATCHDOG_OPKG:-opkg}"
+PATH="${WG_WATCHDOG_INSTALL_PATH:-$OPT_ROOT/bin:$OPT_ROOT/sbin:/usr/sbin:/usr/bin:/sbin:/bin}"
 export PATH
 
 TMP_FILES=""
+FORCE_INSTALL=no
 
 cleanup() {
     for file in $TMP_FILES; do
@@ -24,6 +30,15 @@ trap cleanup EXIT HUP INT TERM
 
 say() { printf '%s\n' "$*"; }
 die() { say "Ошибка: $*" >&2; exit 1; }
+
+confirm_yes() {
+    printf '%s [Y/n]: ' "$1" > "$OUTPUT_DEVICE"
+    IFS= read -r answer < "$INPUT_DEVICE" || die "не удалось прочитать ответ"
+    case "$answer" in
+        n|N|no|NO|No|н|Н|нет|Нет|НЕТ) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 
 make_temp() {
     tmp_file="$TMP_DIR/wg-watchdog-install.$$.$1"
@@ -53,6 +68,14 @@ install_if_changed() {
     mv "$source_file" "$destination" || die "не удалось установить $destination"
 }
 
+validate_script_version() {
+    script_file=$1
+    script_name=$2
+    downloaded_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$script_file" | sed -n '1p')
+    [ "$downloaded_version" = "$VERSION" ] || \
+        die "$script_name имеет версию ${downloaded_version:-неизвестно}, ожидалась $VERSION; установка отменена"
+}
+
 ensure_short_command() {
     if [ -L "$SHORT_COMMAND" ] && [ "$(readlink "$SHORT_COMMAND" 2>/dev/null)" = "$MANAGER_PATH" ]; then
         return 0
@@ -69,11 +92,71 @@ ensure_short_command() {
     ln -s "$MANAGER_PATH" "$SHORT_COMMAND" || die "не удалось создать команду wgwm"
 }
 
+show_summary() {
+    run_command=$MANAGER_PATH
+    if [ -L "$SHORT_COMMAND" ] && [ "$(readlink "$SHORT_COMMAND" 2>/dev/null)" = "$MANAGER_PATH" ]; then
+        run_command=wgwm
+    fi
+    say ""
+    say "WG Watchdog $VERSION установлен."
+    say ""
+    say "Установлено:"
+    say "  Менеджер:  $MANAGER_PATH"
+    say "  Watchdog:  $WATCHDOG_PATH"
+    if [ "$run_command" = "wgwm" ]; then
+        say "  Команда:   wgwm"
+    else
+        say "  Запуск:    $MANAGER_PATH"
+    fi
+    say ""
+    say "Дальнейшие действия:"
+    say "  Запустить и настроить:  $run_command"
+    say "  Принудительно переустановить:"
+    say "    wget -qO- $BASE_URL/install.sh | sh -s -- --force"
+    say "  Удалить: запустите $run_command и выберите «Удалить WG Watchdog»."
+    say ""
+    say "При первом запуске wgwm при необходимости установит ndmq и cron."
+}
+
+case "${1:-}" in
+    '') ;;
+    -force|--force) FORCE_INSTALL=yes ;;
+    -h|--help)
+        say "Использование: install.sh [--force]"
+        say "Без ключа установленная программа просто запускается; --force переустанавливает файлы."
+        exit 0
+        ;;
+    *) die "неизвестный параметр: $1" ;;
+esac
+[ "$#" -le 1 ] || die "укажите не более одного параметра"
+
 [ "$(id -u 2>/dev/null)" = "0" ] || die "запустите установщик от пользователя root"
-[ -d /opt ] || die "каталог /opt отсутствует — сначала установите Entware"
-command -v opkg >/dev/null 2>&1 || die "команда opkg не найдена — Entware не запущен"
-[ -r /dev/tty ] && [ -w /dev/tty ] || die "установщик нужно запускать из интерактивного терминала"
-mkdir -p /opt/bin "$TMP_DIR" || die "не удалось подготовить каталог /opt/bin"
+[ -d "$OPT_ROOT" ] || die "каталог $OPT_ROOT отсутствует — сначала установите Entware"
+command -v "$OPKG_BIN" >/dev/null 2>&1 || die "команда opkg не найдена — Entware не запущен"
+[ -r "$INPUT_DEVICE" ] && [ -w "$OUTPUT_DEVICE" ] || die "установщик нужно запускать из интерактивного терминала"
+mkdir -p "$OPT_ROOT/bin" "$TMP_DIR" || die "не удалось подготовить каталог $OPT_ROOT/bin"
+
+# Версии 1.3.0+ сами проверяют обновления. Повторный запуск ссылки только
+# восстанавливает короткую команду при необходимости и открывает менеджер.
+if [ "$FORCE_INSTALL" != "yes" ] && [ -x "$MANAGER_PATH" ] && [ -x "$WATCHDOG_PATH" ] && \
+   grep -q '^VERSION_URL=' "$MANAGER_PATH" 2>/dev/null; then
+    ensure_short_command
+    exec "$MANAGER_PATH"
+    die "не удалось запустить установленный менеджер"
+fi
+
+FIRST_INSTALL=no
+if [ ! -e "$MANAGER_PATH" ] && [ ! -e "$WATCHDOG_PATH" ]; then
+    FIRST_INSTALL=yes
+fi
+if [ "$FIRST_INSTALL" = "yes" ]; then
+    say "WG Watchdog контролирует доступность WG-сервера и перезапускает"
+    say "зависший WireGuard-интерфейс по заданным правилам."
+    confirm_yes "Установить WG Watchdog?" || {
+        say "Установка отменена."
+        exit 0
+    }
+fi
 
 make_temp watchdog
 tmp_watchdog=$REPLY
@@ -85,11 +168,11 @@ download_file "$WATCHDOG_URL" "$tmp_watchdog" || die "не удалось заг
 download_file "$MANAGER_URL" "$tmp_manager" || die "не удалось загрузить менеджер"
 sh -n "$tmp_watchdog" || die "ошибка синтаксиса в загруженном watchdog"
 sh -n "$tmp_manager" || die "ошибка синтаксиса в загруженном менеджере"
+validate_script_version "$tmp_watchdog" watchdog
+validate_script_version "$tmp_manager" менеджер
 
 install_if_changed "$tmp_watchdog" "$WATCHDOG_PATH"
 install_if_changed "$tmp_manager" "$MANAGER_PATH"
 ensure_short_command
-
-# Вызов по ссылке уже означает согласие начать настройку.
-exec "$MANAGER_PATH" --from-installer
-die "не удалось запустить менеджер"
+show_summary
+exit 0

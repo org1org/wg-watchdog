@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
@@ -280,11 +280,18 @@ install_program_files() {
     make_temp manager
     tmp_manager=$REPLY
 
-    info "Проверяю файлы WG Watchdog версии $VERSION..."
+    target_version=${REMOTE_VERSION:-$VERSION}
+    info "Загружаю файлы WG Watchdog версии $target_version..."
     download_file "$WATCHDOG_URL" "$tmp_watchdog" || die "не удалось загрузить watchdog"
     download_file "$MANAGER_URL" "$tmp_manager" || die "не удалось загрузить менеджер"
     sh -n "$tmp_watchdog" || die "ошибка синтаксиса в загруженном watchdog"
     sh -n "$tmp_manager" || die "ошибка синтаксиса в загруженном менеджере"
+    downloaded_watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$tmp_watchdog" | sed -n '1p')
+    downloaded_manager_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$tmp_manager" | sed -n '1p')
+    [ "$downloaded_watchdog_version" = "$target_version" ] || \
+        die "watchdog имеет версию ${downloaded_watchdog_version:-неизвестно}, ожидалась $target_version"
+    [ "$downloaded_manager_version" = "$target_version" ] || \
+        die "менеджер имеет версию ${downloaded_manager_version:-неизвестно}, ожидалась $target_version"
     chmod 755 "$tmp_watchdog" "$tmp_manager" || die "не удалось установить права"
     if [ -f "$WATCHDOG_PATH" ] && cmp -s "$tmp_watchdog" "$WATCHDOG_PATH"; then
         rm -f "$tmp_watchdog"
@@ -782,15 +789,26 @@ configure_job() {
         fi
     fi
 
-    say "Нажмите Enter, чтобы принять значение в скобках."
-    ask_integer_range PING_COUNT "PING_COUNT — число ping-запросов при проверке" "$default_ping_count" 1 10
-    ask_integer_range PING_TIMEOUT "PING_TIMEOUT — ожидание каждого ответа, секунд" "$default_ping_timeout" 1 30
-    ask_integer_range RESTART_DELAY "RESTART_DELAY — пауза down/up интерфейса, секунд" "$default_restart_delay" 1 60
-    ask_interval "$default_interval"
-    ask_integer_range FAILURE_THRESHOLD "FAILURE_THRESHOLD — неудачных проверок до перезапуска" "$default_failure_threshold" 1 10
-    ask_integer_range RESTART_COOLDOWN "RESTART_COOLDOWN — пауза между перезапусками, минут" "$default_restart_cooldown" 1 1440
-    ask_integer_range BOOT_GRACE "BOOT_GRACE — ожидание после загрузки роутера, секунд" "$default_boot_grace" 1 3600
-    ask_integer_range RECOVERY_CHECK_DELAY "RECOVERY_CHECK_DELAY — ожидание проверки после перезапуска, секунд" "$default_recovery_delay" 1 300
+    if [ "$mode" = "add" ]; then
+        PING_COUNT=$default_ping_count
+        PING_TIMEOUT=$default_ping_timeout
+        RESTART_DELAY=$default_restart_delay
+        CHECK_INTERVAL=$default_interval
+        FAILURE_THRESHOLD=$default_failure_threshold
+        RESTART_COOLDOWN=$default_restart_cooldown
+        BOOT_GRACE=$default_boot_grace
+        RECOVERY_CHECK_DELAY=$default_recovery_delay
+    else
+        say "Нажмите Enter, чтобы принять значение в скобках."
+        ask_integer_range PING_COUNT "PING_COUNT — число ping-запросов при проверке" "$default_ping_count" 1 10
+        ask_integer_range PING_TIMEOUT "PING_TIMEOUT — ожидание каждого ответа, секунд" "$default_ping_timeout" 1 30
+        ask_integer_range RESTART_DELAY "RESTART_DELAY — пауза down/up интерфейса, секунд" "$default_restart_delay" 1 60
+        ask_interval "$default_interval"
+        ask_integer_range FAILURE_THRESHOLD "FAILURE_THRESHOLD — неудачных проверок до перезапуска" "$default_failure_threshold" 1 10
+        ask_integer_range RESTART_COOLDOWN "RESTART_COOLDOWN — пауза между перезапусками, минут" "$default_restart_cooldown" 1 1440
+        ask_integer_range BOOT_GRACE "BOOT_GRACE — ожидание после загрузки роутера, секунд" "$default_boot_grace" 1 3600
+        ask_integer_range RECOVERY_CHECK_DELAY "RECOVERY_CHECK_DELAY — ожидание проверки после перезапуска, секунд" "$default_recovery_delay" 1 300
+    fi
     ENABLED=$old_enabled
 
     if [ -n "$original_job" ] && [ "$original_job" != "$JOB_ID" ]; then
@@ -807,6 +825,14 @@ configure_job() {
         saved_state="выключено"
     fi
     info "Задание $saved_job сохранено и $saved_state."
+    if [ "$mode" = "add" ]; then
+        say "Применены рекомендуемые параметры:"
+        say "  проверка каждые $CHECK_INTERVAL мин.; $PING_COUNT ping по $PING_TIMEOUT сек.;"
+        say "  перезапуск после $FAILURE_THRESHOLD неудачных проверок; пауза down/up $RESTART_DELAY сек.;"
+        say "  контроль после перезапуска через $RECOVERY_CHECK_DELAY сек.; cooldown $RESTART_COOLDOWN мин.;"
+        say "  ожидание после загрузки роутера $BOOT_GRACE сек."
+        say "Изменить эти значения можно через пункт «Изменить задание»."
+    fi
 }
 
 build_job_index() {
@@ -910,6 +936,61 @@ run_job_now() {
     fi
 }
 
+remove_managed_cron() {
+    [ -f "$CRONTAB_PATH" ] || return 0
+    make_temp cron-uninstall
+    clean_file=$REPLY
+    awk -v begin="$CRON_BEGIN" -v end="$CRON_END" '
+        $0 == begin { managed = 1; next }
+        $0 == end { managed = 0; next }
+        managed { next }
+        /\/opt\/bin\/wg-watchdog\.sh/ { next }
+        { print }
+    ' "$CRONTAB_PATH" > "$clean_file" || die "не удалось очистить crontab"
+    if cmp -s "$clean_file" "$CRONTAB_PATH"; then
+        rm -f "$clean_file"
+        return 0
+    fi
+    chmod 600 "$clean_file" || die "не удалось установить права на crontab"
+    cp "$CRONTAB_PATH" "$CRONTAB_PATH.wg-watchdog.bak" 2>/dev/null || true
+    mv "$clean_file" "$CRONTAB_PATH" || die "не удалось сохранить crontab"
+    if [ -x "$CRON_INIT" ]; then
+        "$CRON_INIT" restart >/dev/null 2>&1 || \
+            say "Предупреждение: не удалось перезапустить cron."
+    fi
+}
+
+uninstall_program() {
+    say ""
+    say "Будут удалены программа, все задания WG Watchdog, их состояние и строки cron."
+    say "Пакеты Entware cron и ndmq останутся: они могут использоваться другими программами."
+    confirm "Полностью удалить WG Watchdog?" || return 0
+
+    remove_managed_cron
+    for file in "$CONFIG_DIR"/*.conf; do
+        [ -f "$file" ] && rm -f "$file"
+    done
+    for file in "$STATE_DIR"/*.state "$RUN_DIR"/*.pid; do
+        [ -f "$file" ] && rm -f "$file"
+    done
+    for lock_dir in "$RUN_DIR"/wg-watchdog-*.lock; do
+        [ -d "$lock_dir" ] || continue
+        rm -f "$lock_dir/pid"
+        rmdir "$lock_dir" 2>/dev/null || true
+    done
+    rmdir "$CONFIG_DIR" 2>/dev/null || true
+    rmdir "$STATE_DIR" 2>/dev/null || true
+    if [ "$RUN_DIR" != "$STATE_DIR" ]; then
+        rmdir "$RUN_DIR" 2>/dev/null || true
+    fi
+    if [ -L "$SHORT_COMMAND" ] && [ "$(readlink "$SHORT_COMMAND" 2>/dev/null)" = "$MANAGER_PATH" ]; then
+        rm -f "$SHORT_COMMAND"
+    fi
+    rm -f "$WATCHDOG_PATH" "$MANAGER_PATH"
+    say "WG Watchdog удалён. Сторонние задания cron сохранены."
+    exit 0
+}
+
 show_header() {
     say ""
     printf '%s%s%s\n' "$COLOR_CYAN" 'WG Watchdog Manager' "$COLOR_RESET"
@@ -949,6 +1030,7 @@ main_menu() {
         if [ "$JOB_COUNT" -eq 0 ]; then
             say "  1) Добавить задание"
             show_update_menu_item 2
+            say "  3) Удалить WG Watchdog"
             say "  0) Выход"
         else
             say "  1) Добавить задание"
@@ -958,6 +1040,7 @@ main_menu() {
             say "  5) Показать подробный статус"
             say "  6) Удалить задание"
             show_update_menu_item 7
+            say "  8) Удалить WG Watchdog"
             say "  0) Выход"
         fi
         read_answer "Выберите действие" "0"
@@ -965,6 +1048,7 @@ main_menu() {
             case "$REPLY" in
                 1) configure_job add "" ;;
                 2) perform_update ;;
+                3) uninstall_program ;;
                 0) return 0 ;;
                 *) say "Неизвестный пункт меню." ;;
             esac
@@ -981,6 +1065,7 @@ main_menu() {
             5) [ "$JOB_COUNT" -gt 0 ] && show_job_status || say "Нет настроенных заданий." ;;
             6) [ "$JOB_COUNT" -gt 0 ] && delete_job || say "Нет настроенных заданий." ;;
             7) perform_update ;;
+            8) uninstall_program ;;
             0) return 0 ;;
             *) say "Неизвестный пункт меню." ;;
         esac
@@ -991,9 +1076,8 @@ if [ "${WG_WATCHDOG_LIB_ONLY:-no}" = "yes" ]; then
     return 0 2>/dev/null || exit 0
 fi
 
-SKIP_CONFIRM=no
 case "${1:-}" in
-    --from-installer|--after-update) SKIP_CONFIRM=yes ;;
+    --from-installer|--after-update) ;;
     '') ;;
     *) die "неизвестный параметр: $1" ;;
 esac
@@ -1002,10 +1086,6 @@ esac
     die "менеджер нужно запускать из интерактивного терминала"
 open_console
 show_header
-if [ "$SKIP_CONFIRM" != "yes" ] && ! confirm_yes "Продолжить?"; then
-    say "Настройка отменена."
-    exit 0
-fi
 ensure_environment
 cleanup_legacy_state
 migrate_legacy_config
