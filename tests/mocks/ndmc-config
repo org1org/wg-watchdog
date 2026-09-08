@@ -7,8 +7,30 @@ interface GigabitEthernet0
 interface Wireguard0
  description "Удалённый офис"
  security-level private
+ ip address 10.0.0.2 255.255.255.255
+ wireguard peer abcdefghijklmnopqrstuvwxyz0123456789ABCDE=
+ endpoint 198.51.100.10:36666
+ allow-ips 10.0.0.1 255.255.255.255
+ connect
 !
 interface Wireguard2
  security-level private
+ ip address 10.2.0.2 255.255.255.255
+ wireguard peer zyxwvutsrqponmlkjihgfedcba9876543210ABCDE=
+ endpoint wg.example.test:51820
+ allow-ips 10.2.0.1/32
+ connect
+!
+interface Wireguard3
+ description "Два пира"
+ ip address 10.3.0.2 255.255.255.255
+ wireguard peer firstpeerABCDEFGHIJKLMNOPQRSTUVWXYZ012345=
+ endpoint first.example.test:51820
+ allow-ips 10.3.0.1 255.255.255.255
+ connect
+ wireguard peer secondpeerABCDEFGHIJKLMNOPQRSTUVWXYZ01234=
+ endpoint [2001:db8::10]:51820
+ allow-ips 10.3.0.10 255.255.255.255
+ connect
 !
 EOF

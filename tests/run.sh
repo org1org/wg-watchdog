@@ -280,6 +280,34 @@ if printf '%s\n' "$INTERFACE_LIST" | grep -F 'GigabitEthernet0' >/dev/null; then
 fi
 pass "парсер находит интерфейсы WireGuard и их описания"
 
+# Адреса сервера извлекаются из endpoint и одиночного маршрута allow-ips.
+detect_peer_defaults Wireguard0
+assert_equal "$DETECTED_PUBLIC_IP" "198.51.100.10" "IPv4 endpoint"
+assert_equal "$DETECTED_TUNNEL_IP" "10.0.0.1" "allow-ips с маской"
+detect_peer_defaults Wireguard2
+assert_equal "$DETECTED_PUBLIC_IP" "wg.example.test" "DNS endpoint"
+assert_equal "$DETECTED_TUNNEL_IP" "10.2.0.1" "allow-ips в CIDR"
+pass "адреса сервера автоматически извлекаются из выбранного пира"
+
+# При нескольких пирах выбранная строка определяет обе связанные подсказки.
+printf '2\n' > "$TEST_ROOT/peer-answer"
+INPUT_DEVICE="$TEST_ROOT/peer-answer"
+OUTPUT_DEVICE="$TEST_ROOT/peer-prompt"
+detect_peer_defaults Wireguard3 >/dev/null
+assert_equal "$DETECTED_PUBLIC_IP" "2001:db8::10" "IPv6 endpoint второго пира"
+assert_equal "$DETECTED_TUNNEL_IP" "10.3.0.10" "внутренний адрес второго пира"
+pass "при нескольких пирах адреса берутся из выбранного пира"
+
+# Enter подтверждает продолжение, явный отрицательный ответ отменяет его.
+printf '\n' > "$TEST_ROOT/answer-yes"
+INPUT_DEVICE="$TEST_ROOT/answer-yes"
+OUTPUT_DEVICE="$TEST_ROOT/prompt"
+confirm_yes "Продолжить" || fail "Enter не подтвердил продолжение"
+printf 'н\n' > "$TEST_ROOT/answer-no"
+INPUT_DEVICE="$TEST_ROOT/answer-no"
+if confirm_yes "Продолжить"; then fail "ответ 'н' не отменил продолжение"; fi
+pass "приветственное подтверждение использует Enter как «да»"
+
 # Обновление конфигурации v1.1 добавляет новые параметры и исправляет неточный cron-интервал.
 MANAGER_ROOT="$TEST_ROOT/manager"
 CONFIG_DIR="$MANAGER_ROOT/config"

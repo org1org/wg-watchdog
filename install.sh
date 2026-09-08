@@ -2,7 +2,7 @@
 
 # Interactive installer and job manager for WG Watchdog.
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
 MANAGER_URL="$BASE_URL/install.sh"
@@ -21,10 +21,20 @@ PIDOF_BIN="pidof"
 CRON_BEGIN="# BEGIN WG-WATCHDOG — managed automatically"
 CRON_END="# END WG-WATCHDOG"
 TTY_DEVICE="${WG_WATCHDOG_TTY:-/dev/tty}"
+INPUT_DEVICE="${WG_WATCHDOG_INPUT:-$TTY_DEVICE}"
+OUTPUT_DEVICE="${WG_WATCHDOG_OUTPUT:-$TTY_DEVICE}"
 PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
 TMP_FILES=""
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    COLOR_GREEN=$(printf '\033[1;32m')
+    COLOR_RESET=$(printf '\033[0m')
+else
+    COLOR_GREEN=""
+    COLOR_RESET=""
+fi
 
 cleanup() {
     for file in $TMP_FILES; do
@@ -34,6 +44,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 say() { printf '%s\n' "$*"; }
+info() { printf '\n%s%s%s\n\n' "$COLOR_GREEN" "$*" "$COLOR_RESET"; }
 die() { say "Ошибка: $*" >&2; exit 1; }
 
 make_temp() {
@@ -47,21 +58,30 @@ read_answer() {
     prompt=$1
     default_value=${2:-}
     if [ -n "$default_value" ]; then
-        printf '%s [%s]: ' "$prompt" "$default_value" > "$TTY_DEVICE"
+        printf '%s [%s]: ' "$prompt" "$default_value" > "$OUTPUT_DEVICE"
     else
-        printf '%s: ' "$prompt" > "$TTY_DEVICE"
+        printf '%s: ' "$prompt" > "$OUTPUT_DEVICE"
     fi
-    IFS= read -r answer < "$TTY_DEVICE" || die "не удалось прочитать ответ"
+    IFS= read -r answer < "$INPUT_DEVICE" || die "не удалось прочитать ответ"
     [ -n "$answer" ] || answer=$default_value
     REPLY=$answer
 }
 
 confirm() {
-    printf '%s [д/Н]: ' "$1" > "$TTY_DEVICE"
-    IFS= read -r answer < "$TTY_DEVICE" || die "не удалось прочитать ответ"
+    printf '%s [д/Н]: ' "$1" > "$OUTPUT_DEVICE"
+    IFS= read -r answer < "$INPUT_DEVICE" || die "не удалось прочитать ответ"
     case "$answer" in
         д|Д|да|Да|ДА|y|Y|yes|YES|Yes) return 0 ;;
         *) return 1 ;;
+    esac
+}
+
+confirm_yes() {
+    printf '%s [Д/н]: ' "$1" > "$OUTPUT_DEVICE"
+    IFS= read -r answer < "$INPUT_DEVICE" || die "не удалось прочитать ответ"
+    case "$answer" in
+        н|Н|нет|Нет|НЕТ|n|N|no|NO|No) return 1 ;;
+        *) return 0 ;;
     esac
 }
 
@@ -144,7 +164,8 @@ download_file() {
 }
 
 ensure_environment() {
-    [ -r "$TTY_DEVICE" ] || die "менеджер нужно запускать из интерактивного терминала"
+    [ -r "$INPUT_DEVICE" ] && [ -w "$OUTPUT_DEVICE" ] || \
+        die "менеджер нужно запускать из интерактивного терминала"
     [ "$(id -u 2>/dev/null)" = "0" ] || die "запустите менеджер от пользователя root"
     [ -d /opt ] || die "каталог /opt отсутствует — сначала установите Entware"
     command -v opkg >/dev/null 2>&1 || die "команда opkg не найдена — Entware не запущен"
@@ -152,15 +173,17 @@ ensure_environment() {
         die "не удалось создать рабочие каталоги"
 
     if ! command -v "$NDMC_BIN" >/dev/null 2>&1; then
-        say "Устанавливаю ndmq для управления KeeneticOS..."
+        info "Устанавливаю ndmq для управления KeeneticOS..."
         opkg update || die "не удалось обновить список пакетов Entware"
         opkg install ndmq || die "не удалось установить ndmq"
+        say ""
     fi
 
     if [ ! -x "$CRON_INIT" ]; then
-        say "Устанавливаю cron..."
+        info "Устанавливаю cron..."
         opkg update || die "не удалось обновить список пакетов Entware"
         opkg install cron || die "не удалось установить cron"
+        say ""
     fi
 
     if grep -q '^ENABLED=no' "$CRON_INIT" 2>/dev/null; then
@@ -175,7 +198,7 @@ install_program_files() {
     make_temp manager
     tmp_manager=$REPLY
 
-    say "Проверяю файлы WG Watchdog версии $VERSION..."
+    info "Проверяю файлы WG Watchdog версии $VERSION..."
     download_file "$WATCHDOG_URL" "$tmp_watchdog" || die "не удалось загрузить watchdog"
     download_file "$MANAGER_URL" "$tmp_manager" || die "не удалось загрузить менеджер"
     sh -n "$tmp_watchdog" || die "ошибка синтаксиса в загруженном watchdog"
@@ -259,6 +282,96 @@ choose_interface() {
     read_answer "Введите системное имя WireGuard-интерфейса" "${current:-Wireguard0}"
     valid_interface "$REPLY" || die "недопустимое имя интерфейса: $REPLY"
     WG_INTERFACE=$REPLY
+}
+
+detect_peer_defaults() {
+    selected_interface=$1
+    PEER_LIST=$(printf '%s\n' "$RUNNING_CONFIG" | awk -v wanted="$selected_interface" '
+        function endpoint_host(value, closing, count, parts) {
+            if (substr(value, 1, 1) == "[") {
+                closing = index(value, "]")
+                if (closing > 2) return substr(value, 2, closing - 2)
+            }
+            count = split(value, parts, ":")
+            if (count == 2) return parts[1]
+            return value
+        }
+        function flush_peer() {
+            if (!in_peer) return
+            if (endpoint == "") endpoint = "-"
+            if (tunnel_ip == "") tunnel_ip = "-"
+            peer_label = substr(peer_key, 1, 8)
+            print endpoint "\t" tunnel_ip "\t" peer_label
+        }
+        $1 == "interface" {
+            if (in_target) {
+                flush_peer()
+                in_target = 0
+                exit
+            }
+            in_target = ($2 == wanted)
+            in_peer = 0
+            next
+        }
+        in_target && $1 == "wireguard" && $2 == "peer" {
+            flush_peer()
+            in_peer = 1
+            peer_key = $3
+            endpoint = ""
+            tunnel_ip = ""
+            next
+        }
+        in_target && in_peer && $1 == "endpoint" {
+            endpoint = endpoint_host($2)
+            next
+        }
+        in_target && in_peer && $1 == "allow-ips" && tunnel_ip == "" {
+            candidate = $2
+            if (candidate ~ /\/32$/) {
+                sub(/\/32$/, "", candidate)
+                if (candidate != "0.0.0.0") tunnel_ip = candidate
+            } else if ($3 == "255.255.255.255" && candidate != "0.0.0.0") {
+                tunnel_ip = candidate
+            }
+        }
+        END {
+            if (in_target) flush_peer()
+        }
+    ')
+
+    DETECTED_TUNNEL_IP=""
+    DETECTED_PUBLIC_IP=""
+    peer_count=$(printf '%s\n' "$PEER_LIST" | awk 'NF { count++ } END { print count + 0 }')
+    [ "$peer_count" -gt 0 ] || return 0
+
+    peer_index=1
+    if [ "$peer_count" -gt 1 ]; then
+        say "Найдено несколько пиров выбранного интерфейса:"
+        printf '%s\n' "$PEER_LIST" | while IFS="$(printf '\t')" read -r endpoint tunnel_ip peer_label; do
+            [ "$endpoint" = "-" ] && endpoint="внешний адрес не найден"
+            [ "$tunnel_ip" = "-" ] && tunnel_ip="внутренний адрес не найден"
+            printf '  %s) peer %s… — %s; %s\n' \
+                "$peer_index" "$peer_label" "$endpoint" "$tunnel_ip"
+            peer_index=$((peer_index + 1))
+        done
+        while :; do
+            read_answer "Выберите пир WG-сервера" "1"
+            if is_positive_integer "$REPLY" && [ "$REPLY" -le "$peer_count" ]; then
+                selected_peer=$REPLY
+                break
+            fi
+            say "Введите номер от 1 до $peer_count."
+        done
+    else
+        selected_peer=1
+    fi
+
+    selected_row=$(printf '%s\n' "$PEER_LIST" | sed -n "${selected_peer}p")
+    DETECTED_PUBLIC_IP=$(printf '%s\n' "$selected_row" | cut -f1)
+    DETECTED_TUNNEL_IP=$(printf '%s\n' "$selected_row" | cut -f2)
+    [ "$DETECTED_PUBLIC_IP" = "-" ] && DETECTED_PUBLIC_IP=""
+    [ "$DETECTED_TUNNEL_IP" = "-" ] && DETECTED_TUNNEL_IP=""
+    return 0
 }
 
 load_config() {
@@ -403,7 +516,7 @@ migrate_legacy_config() {
         ENABLED=yes
         write_config
         mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.migrated-v1.0.0"
-        say "Конфигурация v1.0.0 перенесена в формат v1.2.1."
+        say "Конфигурация v1.0.0 перенесена в формат v1.2.2."
     else
         say "Предупреждение: старую конфигурацию не удалось перенести автоматически."
     fi
@@ -477,6 +590,23 @@ configure_job() {
         return 1
     fi
 
+    detect_peer_defaults "$WG_INTERFACE"
+    if [ -z "$default_server" ] && [ -n "$DETECTED_TUNNEL_IP" ]; then
+        default_server=$DETECTED_TUNNEL_IP
+    fi
+    if [ -z "$default_public_ip" ] && [ -n "$DETECTED_PUBLIC_IP" ]; then
+        default_public_ip=$DETECTED_PUBLIC_IP
+    fi
+    if [ -n "$DETECTED_TUNNEL_IP" ] || [ -n "$DETECTED_PUBLIC_IP" ]; then
+        info "Адреса подставлены из настроек выбранного WireGuard-пира."
+    fi
+    if [ "$mode" = "add" ] && [ -z "$DETECTED_TUNNEL_IP" ]; then
+        say "Внутренний адрес сервера не удалось определить автоматически."
+        say "Он отсутствует в конфигурации, если в Allowed IPs указана только сеть или 0.0.0.0/0."
+        say "Введите адрес сервера внутри WireGuard-туннеля вручную."
+        say ""
+    fi
+
     while :; do
         read_answer "Введите внутренний IP-адрес WireGuard-сервера" "$default_server"
         if valid_address "$REPLY"; then
@@ -486,7 +616,7 @@ configure_job() {
         say "Введите IP-адрес или имя хоста без пробелов."
     done
 
-    say "Проверяю связь с $WG_SERVER_TUNNEL_IP..."
+    info "Проверяю связь с $WG_SERVER_TUNNEL_IP..."
     if "$PING_BIN" -c 3 -W 3 "$WG_SERVER_TUNNEL_IP" >/dev/null 2>&1; then
         say "Сервер отвечает на ping."
     else
@@ -504,7 +634,7 @@ configure_job() {
     done
 
     if [ -n "$WG_SERVER_PUBLIC_IP" ]; then
-        say "Проверяю публичный адрес $WG_SERVER_PUBLIC_IP..."
+        info "Проверяю публичный адрес $WG_SERVER_PUBLIC_IP..."
         if "$PING_BIN" -c 1 -W 3 "$WG_SERVER_PUBLIC_IP" >/dev/null 2>&1; then
             say "Публичный адрес WG-сервера отвечает."
         else
@@ -539,7 +669,7 @@ configure_job() {
     else
         saved_state="выключено"
     fi
-    say "Задание $saved_job сохранено и $saved_state."
+    info "Задание $saved_job сохранено и $saved_state."
 }
 
 build_job_index() {
@@ -644,9 +774,7 @@ run_job_now() {
 }
 
 show_header() {
-    say ""
-    say "WG Watchdog для KeeneticOS + Entware, версия $VERSION"
-    say ""
+    info "WG Watchdog для KeeneticOS + Entware, версия $VERSION"
     say "Менеджер создаёт отдельное задание для каждого WireGuard-интерфейса."
     say "Если интернет работает, но WG-сервер не отвечает, соответствующий"
     say "интерфейс автоматически перезапускается с заданной периодичностью."
@@ -689,6 +817,12 @@ if [ "${WG_WATCHDOG_LIB_ONLY:-no}" = "yes" ]; then
 fi
 
 show_header
+[ -r "$INPUT_DEVICE" ] && [ -w "$OUTPUT_DEVICE" ] || \
+    die "менеджер нужно запускать из интерактивного терминала"
+if ! confirm_yes "Продолжить?"; then
+    say "Настройка отменена."
+    exit 0
+fi
 ensure_environment
 cleanup_legacy_state
 migrate_legacy_config
