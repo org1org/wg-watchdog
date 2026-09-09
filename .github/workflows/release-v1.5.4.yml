@@ -1,0 +1,41 @@
+name: Release v1.5.4
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/release-v1.5.4.yml]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Проверить версию и тесты
+        run: |
+          test "$(cat VERSION)" = "1.5.4"
+          sh -n install.sh
+          sh -n wg-watchdog-manager.sh
+          sh -n wg-watchdog.sh
+          sudo dash tests/run.sh
+          python3 tests/terminal.py
+      - name: Создать тег и релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: 51045d74ce01ff00cb3b3a2b18f30e8bddbf042c
+        run: |
+          gh release create v1.5.4 --repo "$GITHUB_REPOSITORY" --target "$TARGET_SHA" --title "WG Watchdog v1.5.4" --notes "$(printf '%s\n' \
+            '- Главный экран показывает все найденные WireGuard-интерфейсы.' \
+            '- Включённые проверки выделены зелёным, выключенные красным, ненастроенные интерфейсы серым.' \
+            '- Между шапкой, интерфейсами и действиями добавлены отступы.' \
+            '- Изменение, включение/выключение, ручная проверка, статус и удаление показывают актуальный список заданий.' \
+            '- В выборе задания убрано значение по умолчанию: Enter больше не выбирает первое задание.' \
+            '- В каждый экран выбора добавлен пункт 0 для возврата в главное меню.' \
+            '- Удалён старый код страниц заданий, больше не используемый новым главным экраном.' \
+            '- Пройдены 57 функциональных и 6 терминальных проверок.')"
+      - name: Удалить одноразовый workflow
+        run: |
+          git rm .github/workflows/release-v1.5.4.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "Remove one-time v1.5.4 release workflow"
+          git push origin HEAD:main
