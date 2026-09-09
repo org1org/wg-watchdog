@@ -27,7 +27,8 @@ jobs:
           dash -n wg-watchdog.sh
 
       - name: Run functional tests
-        run: dash tests/run.sh
+        # Production runs as root; ownership tests must use the same privilege.
+        run: sudo dash tests/run.sh
 
       - name: Run terminal tests
         run: python3 tests/terminal.py
