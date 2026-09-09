@@ -1,0 +1,64 @@
+name: Finalize v1.6.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/finalize-v1.6.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check shell syntax
+        run: |
+          sh -n install.sh
+          sh -n wg-watchdog-manager.sh
+          sh -n wg-watchdog.sh
+          dash -n install.sh
+          dash -n wg-watchdog-manager.sh
+          dash -n wg-watchdog.sh
+
+      - name: Run functional tests
+        run: dash tests/run.sh
+
+      - name: Run terminal tests
+        run: python3 tests/terminal.py
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: 5ace8bff8aa6c1eff05362d145d4d3fe7f195491
+        run: |
+          set -eu
+          git cat-file -e "$TARGET_SHA^{commit}"
+          if git rev-parse -q --verify refs/tags/v1.6.0 >/dev/null; then
+            test "$(git rev-list -n 1 v1.6.0)" = "$TARGET_SHA"
+          else
+            git tag -a v1.6.0 "$TARGET_SHA" -m "WG Watchdog v1.6.0"
+            git push origin refs/tags/v1.6.0
+          fi
+          cat > release-notes.md <<'EOF'
+          - Добавлен строгий манифест `RELEASE` с версией, неизменяемым commit и SHA-256 обоих скриптов.
+          - Оба файла загружаются в RAM и проверяются по размеру, синтаксису, версии и SHA-256 до записи на `/opt`.
+          - Обновление выполняется транзакционно внутри файловой системы `/opt` с резервной копией предыдущей версии.
+          - При ошибке замены автоматически восстанавливаются оба прежних файла.
+          - После отключения питания следующий запуск завершает очистку либо откатывает незавершённое обновление.
+          - На время установки cron-проверки останавливаются общим барьером обслуживания.
+          - Проверяется свободное место; постоянный кеш обновлений на накопителе не создаётся.
+          - Для безопасного перехода с v1.5.4 и более ранних версий требуется однократная установка с `--force`.
+          - Подтверждена совместимость `sha256sum`, `sync` и `df -Pk` с Entware/BusyBox 1.37 на Keenetic.
+          - Пройдены 65 функциональных и 6 терминальных проверок.
+          EOF
+          if gh release view v1.6.0 >/dev/null 2>&1; then
+            gh release edit v1.6.0 --title "WG Watchdog v1.6.0" --notes-file release-notes.md
+          else
+            gh release create v1.6.0 --verify-tag --title "WG Watchdog v1.6.0" --notes-file release-notes.md
+          fi
