@@ -2,12 +2,14 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.5.4"
+VERSION="1.6.0"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
+RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
 MANAGER_URL="$BASE_URL/wg-watchdog-manager.sh"
 VERSION_URL="$BASE_URL/VERSION"
+RELEASE_MANIFEST_URL="${WG_WATCHDOG_RELEASE_MANIFEST_URL:-$BASE_URL/RELEASE}"
 OPT_ROOT="${WG_WATCHDOG_OPT_ROOT:-/opt}"
 WATCHDOG_PATH="$OPT_ROOT/bin/wg-watchdog.sh"
 MANAGER_PATH="$OPT_ROOT/bin/wg-watchdog-manager"
@@ -15,6 +17,7 @@ SHORT_COMMAND="$OPT_ROOT/bin/wgwm"
 CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-$OPT_ROOT/etc/wg-watchdog.d}"
 STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
+UPDATE_DIR="${WG_WATCHDOG_UPDATE_DIR:-$OPT_ROOT/bin/.wg-watchdog-update}"
 TMP_DIR="${WG_WATCHDOG_TMP_DIR:-/tmp}"
 LEGACY_CONFIG="$OPT_ROOT/etc/wg-watchdog.conf"
 CRONTAB_PATH="$OPT_ROOT/etc/crontab"
@@ -22,12 +25,15 @@ CRON_INIT="$OPT_ROOT/etc/init.d/S10cron"
 NDMC_BIN="${WG_WATCHDOG_NDMC:-ndmc}"
 PING_BIN="${WG_WATCHDOG_PING:-ping}"
 PIDOF_BIN="${WG_WATCHDOG_PIDOF:-pidof}"
+SHA256_BIN="${WG_WATCHDOG_SHA256:-sha256sum}"
+DF_BIN="${WG_WATCHDOG_DF:-df}"
+SYNC_BIN="${WG_WATCHDOG_SYNC:-sync}"
 CRON_BEGIN="# BEGIN WG-WATCHDOG — managed automatically"
 CRON_END="# END WG-WATCHDOG"
 TTY_DEVICE="${WG_WATCHDOG_TTY:-/dev/tty}"
 INPUT_DEVICE="${WG_WATCHDOG_INPUT:-$TTY_DEVICE}"
 OUTPUT_DEVICE="${WG_WATCHDOG_OUTPUT:-$TTY_DEVICE}"
-PATH="/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+PATH="${WG_WATCHDOG_PATH:-/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin}"
 export PATH
 
 TMP_FILES=""
@@ -128,6 +134,9 @@ fi
 
 UPDATE_AVAILABLE=unknown
 REMOTE_VERSION=""
+REMOTE_COMMIT=""
+REMOTE_WATCHDOG_SHA256=""
+REMOTE_MANAGER_SHA256=""
 
 cleanup() {
     printf '%s' "$TMP_FILES" | while IFS= read -r file; do
@@ -393,31 +402,42 @@ version_is_newer() {
     }'
 }
 
-fetch_remote_version() {
-    make_temp version
-    version_file=$REPLY
-    if ! download_file "$VERSION_URL" "$version_file"; then
+fetch_remote_release() {
+    make_temp release
+    release_file=$REPLY
+    if ! download_file "$RELEASE_MANIFEST_URL" "$release_file"; then
         return 1
     fi
-    remote=$(sed -n '1{s/[[:space:]]//g;p;}' "$version_file")
-    case "$remote" in
-        [0-9]*.[0-9]*.[0-9]*) ;;
-        *) return 1 ;;
-    esac
-    if ! printf '%s\n' "$remote" | awk '
-        /^[0-9]+\.[0-9]+\.[0-9]+$/ { ok = 1 }
-        END { exit ok ? 0 : 1 }
-    '; then
-        return 1
-    fi
-    REMOTE_VERSION=$remote
+    release_values=$(awk -F= '
+        $1 == "VERSION" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { version = $2; versions++; next }
+        $1 == "COMMIT" && length($2) == 40 && $2 !~ /[^0-9a-f]/ { commit = $2; commits++; next }
+        $1 == "WATCHDOG_SHA256" && length($2) == 64 && $2 !~ /[^0-9a-f]/ { watchdog = $2; watchdogs++; next }
+        $1 == "MANAGER_SHA256" && length($2) == 64 && $2 !~ /[^0-9a-f]/ { manager = $2; managers++; next }
+        { bad = 1 }
+        END {
+            if (bad || versions != 1 || commits != 1 || watchdogs != 1 || managers != 1) exit 1
+            print version "\t" commit "\t" watchdog "\t" manager
+        }
+    ' "$release_file") || return 1
+    old_ifs=$IFS
+    IFS="$(printf '\t')"
+    set -- $release_values
+    IFS=$old_ifs
+    [ "$#" -eq 4 ] || return 1
+    REMOTE_VERSION=$1
+    REMOTE_COMMIT=$2
+    REMOTE_WATCHDOG_SHA256=$3
+    REMOTE_MANAGER_SHA256=$4
     return 0
 }
 
 check_update_status() {
     UPDATE_AVAILABLE=unknown
     REMOTE_VERSION=""
-    if fetch_remote_version; then
+    REMOTE_COMMIT=""
+    REMOTE_WATCHDOG_SHA256=""
+    REMOTE_MANAGER_SHA256=""
+    if fetch_remote_release; then
         if version_is_newer "$REMOTE_VERSION" "$VERSION"; then
             UPDATE_AVAILABLE=yes
         else
@@ -467,6 +487,139 @@ ensure_environment() {
     fi
 }
 
+valid_update_dir() {
+    [ "$UPDATE_DIR" = "$OPT_ROOT/bin/.wg-watchdog-update" ]
+}
+
+clear_update_dir() {
+    valid_update_dir || return 1
+    [ ! -L "$UPDATE_DIR" ] || return 1
+    rm -f "$UPDATE_DIR/watchdog.new" "$UPDATE_DIR/manager.new" \
+        "$UPDATE_DIR/watchdog.old" "$UPDATE_DIR/manager.old" \
+        "$UPDATE_DIR/watchdog.restore" "$UPDATE_DIR/manager.restore" \
+        "$UPDATE_DIR/state" "$UPDATE_DIR/state.next" || return 1
+    rmdir "$UPDATE_DIR" 2>/dev/null || return 1
+}
+
+write_update_state() {
+    printf '%s\n' "$1" > "$UPDATE_DIR/state.next" || return 1
+    chmod 600 "$UPDATE_DIR/state.next" || return 1
+    mv "$UPDATE_DIR/state.next" "$UPDATE_DIR/state" || return 1
+}
+
+sync_update_storage() {
+    "$SYNC_BIN" >/dev/null 2>&1
+}
+
+sha256_file() {
+    digest=$("$SHA256_BIN" "$1" 2>/dev/null | awk 'NR == 1 { print $1; exit }') || return 1
+    [ "${#digest}" -eq 64 ] || return 1
+    case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+    REPLY=$digest
+}
+
+rollback_update() {
+    valid_update_dir || return 1
+    [ -f "$UPDATE_DIR/watchdog.old" ] && [ -f "$UPDATE_DIR/manager.old" ] || return 1
+    cp "$UPDATE_DIR/watchdog.old" "$UPDATE_DIR/watchdog.restore" || return 1
+    cp "$UPDATE_DIR/manager.old" "$UPDATE_DIR/manager.restore" || return 1
+    chmod 755 "$UPDATE_DIR/watchdog.restore" "$UPDATE_DIR/manager.restore" || return 1
+    sh -n "$UPDATE_DIR/watchdog.restore" && sh -n "$UPDATE_DIR/manager.restore" || return 1
+    mv "$UPDATE_DIR/watchdog.restore" "$WATCHDOG_PATH" || return 1
+    mv "$UPDATE_DIR/manager.restore" "$MANAGER_PATH" || return 1
+    sync_update_storage || return 1
+    if ! clear_update_dir; then
+        say "Предупреждение: служебные файлы обновления будут очищены при следующем запуске."
+    fi
+    return 0
+}
+
+recover_interrupted_update() {
+    [ -e "$UPDATE_DIR" ] || return 0
+    valid_update_dir || return 1
+    [ -d "$UPDATE_DIR" ] && [ ! -L "$UPDATE_DIR" ] || return 1
+    update_state=$(sed -n '1p' "$UPDATE_DIR/state" 2>/dev/null || true)
+    case "$update_state" in
+        committed)
+            clear_update_dir || return 1
+            info "Завершена очистка предыдущего обновления."
+            ;;
+        installing|watchdog-installed)
+            begin_maintenance || return 1
+            if rollback_update; then
+                end_maintenance
+                info "Восстановлена предыдущая версия после незавершённого обновления."
+            else
+                end_maintenance
+                return 1
+            fi
+            ;;
+        '')
+            # Live files are not replaced before the first durable state marker.
+            clear_update_dir || return 1
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+enough_space_for_update() {
+    new_bytes=$(wc -c < "$1") || return 1
+    new_manager_bytes=$(wc -c < "$2") || return 1
+    old_bytes=$(wc -c < "$WATCHDOG_PATH") || return 1
+    old_manager_bytes=$(wc -c < "$MANAGER_PATH") || return 1
+    required_kb=$(((new_bytes + new_manager_bytes + old_bytes + old_manager_bytes + 1023) / 1024 + 64))
+    available_kb=$("$DF_BIN" -Pk "$OPT_ROOT/bin" 2>/dev/null | awk '
+        NR > 1 && $4 ~ /^[0-9]+$/ { available = $4 }
+        END { if (available == "") exit 1; print available }
+    ') || return 1
+    is_positive_integer "$available_kb" || return 1
+    [ "$available_kb" -ge "$required_kb" ]
+}
+
+transactional_install() {
+    source_watchdog=$1
+    source_manager=$2
+    target_version=$3
+    valid_update_dir || return 1
+    [ -f "$WATCHDOG_PATH" ] && [ ! -L "$WATCHDOG_PATH" ] || return 1
+    [ -f "$MANAGER_PATH" ] && [ ! -L "$MANAGER_PATH" ] || return 1
+    [ ! -e "$UPDATE_DIR" ] || return 1
+    enough_space_for_update "$source_watchdog" "$source_manager" || {
+        say "Недостаточно свободного места для обновления и резервной копии."
+        return 1
+    }
+    mkdir "$UPDATE_DIR" || return 1
+    chmod 700 "$UPDATE_DIR" || { clear_update_dir >/dev/null 2>&1 || true; return 1; }
+    if ! cp "$WATCHDOG_PATH" "$UPDATE_DIR/watchdog.old" || \
+       ! cp "$MANAGER_PATH" "$UPDATE_DIR/manager.old" || \
+       ! cp "$source_watchdog" "$UPDATE_DIR/watchdog.new" || \
+       ! cp "$source_manager" "$UPDATE_DIR/manager.new" || \
+       ! chmod 755 "$UPDATE_DIR"/*.old "$UPDATE_DIR"/*.new; then
+        clear_update_dir >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! sh -n "$UPDATE_DIR/watchdog.new" || ! sh -n "$UPDATE_DIR/manager.new" || \
+       ! write_update_state installing || ! sync_update_storage; then
+        clear_update_dir >/dev/null 2>&1 || true
+        return 1
+    fi
+    if ! mv "$UPDATE_DIR/watchdog.new" "$WATCHDOG_PATH" || ! sync_update_storage || \
+       ! write_update_state watchdog-installed || ! sync_update_storage || \
+       ! mv "$UPDATE_DIR/manager.new" "$MANAGER_PATH" || ! sync_update_storage; then
+        rollback_update || say "КРИТИЧЕСКАЯ ОШИБКА: автоматический откат не завершён."
+        return 1
+    fi
+    installed_watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$WATCHDOG_PATH" | sed -n '1p')
+    installed_manager_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$MANAGER_PATH" | sed -n '1p')
+    if [ "$installed_watchdog_version" != "$target_version" ] || \
+       [ "$installed_manager_version" != "$target_version" ] || \
+       ! write_update_state committed || ! sync_update_storage; then
+        rollback_update || say "КРИТИЧЕСКАЯ ОШИБКА: автоматический откат не завершён."
+        return 1
+    fi
+    clear_update_dir
+}
+
 install_program_files() {
     make_temp watchdog
     tmp_watchdog=$REPLY
@@ -475,27 +628,70 @@ install_program_files() {
 
     target_version=${REMOTE_VERSION:-$VERSION}
     info "Загружаю файлы WG Watchdog версии $target_version..."
-    download_file "$WATCHDOG_URL" "$tmp_watchdog" || die "не удалось загрузить watchdog"
-    download_file "$MANAGER_URL" "$tmp_manager" || die "не удалось загрузить менеджер"
-    sh -n "$tmp_watchdog" || die "ошибка синтаксиса в загруженном watchdog"
-    sh -n "$tmp_manager" || die "ошибка синтаксиса в загруженном менеджере"
+    release_url="$RAW_REPOSITORY_URL/$REMOTE_COMMIT"
+    download_file "$release_url/wg-watchdog.sh" "$tmp_watchdog" || {
+        say "Ошибка обновления: не удалось загрузить watchdog."
+        return 1
+    }
+    download_file "$release_url/wg-watchdog-manager.sh" "$tmp_manager" || {
+        say "Ошибка обновления: не удалось загрузить менеджер."
+        return 1
+    }
+    watchdog_size=$(wc -c < "$tmp_watchdog") || {
+        say "Ошибка обновления: не удалось проверить размер watchdog."
+        return 1
+    }
+    manager_size=$(wc -c < "$tmp_manager") || {
+        say "Ошибка обновления: не удалось проверить размер менеджера."
+        return 1
+    }
+    [ "$watchdog_size" -gt 0 ] && [ "$watchdog_size" -le 131072 ] || {
+        say "Ошибка обновления: недопустимый размер watchdog."
+        return 1
+    }
+    [ "$manager_size" -gt 0 ] && [ "$manager_size" -le 262144 ] || {
+        say "Ошибка обновления: недопустимый размер менеджера."
+        return 1
+    }
+    sh -n "$tmp_watchdog" || {
+        say "Ошибка обновления: ошибка синтаксиса в загруженном watchdog."
+        return 1
+    }
+    sh -n "$tmp_manager" || {
+        say "Ошибка обновления: ошибка синтаксиса в загруженном менеджере."
+        return 1
+    }
     downloaded_watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$tmp_watchdog" | sed -n '1p')
     downloaded_manager_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$tmp_manager" | sed -n '1p')
-    [ "$downloaded_watchdog_version" = "$target_version" ] || \
-        die "watchdog имеет версию ${downloaded_watchdog_version:-неизвестно}, ожидалась $target_version"
-    [ "$downloaded_manager_version" = "$target_version" ] || \
-        die "менеджер имеет версию ${downloaded_manager_version:-неизвестно}, ожидалась $target_version"
-    chmod 755 "$tmp_watchdog" "$tmp_manager" || die "не удалось установить права"
-    if [ -f "$WATCHDOG_PATH" ] && cmp -s "$tmp_watchdog" "$WATCHDOG_PATH"; then
-        rm -f "$tmp_watchdog"
-    else
-        mv "$tmp_watchdog" "$WATCHDOG_PATH" || die "не удалось установить watchdog"
-    fi
-    if [ -f "$MANAGER_PATH" ] && cmp -s "$tmp_manager" "$MANAGER_PATH"; then
-        rm -f "$tmp_manager"
-    else
-        mv "$tmp_manager" "$MANAGER_PATH" || die "не удалось установить менеджер"
-    fi
+    [ "$downloaded_watchdog_version" = "$target_version" ] || {
+        say "Ошибка обновления: watchdog имеет версию ${downloaded_watchdog_version:-неизвестно}, ожидалась $target_version."
+        return 1
+    }
+    [ "$downloaded_manager_version" = "$target_version" ] || {
+        say "Ошибка обновления: менеджер имеет версию ${downloaded_manager_version:-неизвестно}, ожидалась $target_version."
+        return 1
+    }
+    sha256_file "$tmp_watchdog" || {
+        say "Ошибка обновления: не удалось вычислить SHA-256 watchdog."
+        return 1
+    }
+    [ "$REPLY" = "$REMOTE_WATCHDOG_SHA256" ] || {
+        say "Ошибка обновления: SHA-256 watchdog не совпадает с манифестом."
+        return 1
+    }
+    sha256_file "$tmp_manager" || {
+        say "Ошибка обновления: не удалось вычислить SHA-256 менеджера."
+        return 1
+    }
+    [ "$REPLY" = "$REMOTE_MANAGER_SHA256" ] || {
+        say "Ошибка обновления: SHA-256 менеджера не совпадает с манифестом."
+        return 1
+    }
+    begin_maintenance || return 1
+    update_result=0
+    transactional_install "$tmp_watchdog" "$tmp_manager" "$target_version" || update_result=$?
+    end_maintenance
+    [ "$update_result" -eq 0 ] || return "$update_result"
     ensure_short_command
 }
 
@@ -522,7 +718,10 @@ perform_update() {
     fi
     say "Доступна версия $REMOTE_VERSION; установлена версия $VERSION."
     confirm "Загрузить и установить обновление?" || return 0
-    install_program_files
+    if ! install_program_files; then
+        say "Обновление не установлено; предыдущая версия сохранена или восстановлена."
+        return 0
+    fi
     info "Обновление установлено. Перезапускаю менеджер..."
     cleanup
     ui_stop
@@ -1347,6 +1546,7 @@ fi
 case "${1:-}" in
     --from-installer|--after-update) ;;
     --uninstall) ;;
+    --repair) ;;
     --plain) ;;
     '') ;;
     *) die "неизвестный параметр: $1" ;;
@@ -1361,8 +1561,18 @@ if [ "${1:-}" != --plain ]; then ui_start; fi
 check_managed_directories
 acquire_manager_lock || die "менеджер уже запущен или его блокировка не завершена; закройте другую сессию"
 MANAGER_LOCK_HELD=yes
+recover_interrupted_update || die "не удалось восстановить незавершённое обновление; запустите установщик с --force"
 if [ "${1:-}" = --uninstall ]; then
     uninstall_program
+    exit 0
+fi
+if [ "${1:-}" = --repair ]; then
+    command -v "$SHA256_BIN" >/dev/null 2>&1 || die "команда sha256sum не найдена"
+    command -v "$DF_BIN" >/dev/null 2>&1 || die "команда df не найдена"
+    command -v "$SYNC_BIN" >/dev/null 2>&1 || die "команда sync не найдена"
+    fetch_remote_release || die "не удалось загрузить корректный манифест выпуска"
+    install_program_files || die "не удалось восстановить программные файлы"
+    say "WG Watchdog $REMOTE_VERSION установлен с проверкой и возможностью отката."
     exit 0
 fi
 rm -f "$RUN_DIR/uninstalled"

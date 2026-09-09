@@ -2,10 +2,10 @@
 
 # Compact bootstrap installer for WG Watchdog.
 
-VERSION="1.5.4"
+VERSION="1.6.0"
 BASE_URL="${WG_WATCHDOG_BASE_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog/main}"
-WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
-MANAGER_URL="$BASE_URL/wg-watchdog-manager.sh"
+RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
+RELEASE_MANIFEST_URL="${WG_WATCHDOG_RELEASE_MANIFEST_URL:-$BASE_URL/RELEASE}"
 OPT_ROOT="${WG_WATCHDOG_OPT_ROOT:-/opt}"
 WATCHDOG_PATH="${WG_WATCHDOG_INSTALL_WATCHDOG:-$OPT_ROOT/bin/wg-watchdog.sh}"
 MANAGER_PATH="${WG_WATCHDOG_INSTALL_MANAGER:-$OPT_ROOT/bin/wg-watchdog-manager}"
@@ -15,6 +15,7 @@ TTY_DEVICE="${WG_WATCHDOG_TTY:-/dev/tty}"
 INPUT_DEVICE="${WG_WATCHDOG_INPUT:-$TTY_DEVICE}"
 OUTPUT_DEVICE="${WG_WATCHDOG_OUTPUT:-$TTY_DEVICE}"
 OPKG_BIN="${WG_WATCHDOG_OPKG:-opkg}"
+SHA256_BIN="${WG_WATCHDOG_SHA256:-sha256sum}"
 PATH="${WG_WATCHDOG_INSTALL_PATH:-$OPT_ROOT/bin:$OPT_ROOT/sbin:/usr/sbin:/usr/bin:/sbin:/bin}"
 export PATH
 
@@ -79,6 +80,46 @@ validate_script_version() {
     downloaded_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$script_file" | sed -n '1p')
     [ "$downloaded_version" = "$VERSION" ] || \
         die "$script_name имеет версию ${downloaded_version:-неизвестно}, ожидалась $VERSION; установка отменена"
+}
+
+fetch_release_manifest() {
+    make_temp release
+    release_file=$REPLY
+    download_file "$RELEASE_MANIFEST_URL" "$release_file" || die "не удалось загрузить манифест выпуска"
+    release_values=$(awk -F= '
+        $1 == "VERSION" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { version = $2; versions++; next }
+        $1 == "COMMIT" && length($2) == 40 && $2 !~ /[^0-9a-f]/ { commit = $2; commits++; next }
+        $1 == "WATCHDOG_SHA256" && length($2) == 64 && $2 !~ /[^0-9a-f]/ { watchdog = $2; watchdogs++; next }
+        $1 == "MANAGER_SHA256" && length($2) == 64 && $2 !~ /[^0-9a-f]/ { manager = $2; managers++; next }
+        { bad = 1 }
+        END {
+            if (bad || versions != 1 || commits != 1 || watchdogs != 1 || managers != 1) exit 1
+            print version "\t" commit "\t" watchdog "\t" manager
+        }
+    ' "$release_file") || die "некорректный манифест выпуска"
+    old_ifs=$IFS
+    IFS="$(printf '\t')"
+    set -- $release_values
+    IFS=$old_ifs
+    [ "$#" -eq 4 ] || die "некорректный манифест выпуска"
+    RELEASE_VERSION=$1
+    RELEASE_COMMIT=$2
+    RELEASE_WATCHDOG_SHA256=$3
+    RELEASE_MANAGER_SHA256=$4
+    [ "$RELEASE_VERSION" = "$VERSION" ] || \
+        die "манифест имеет версию $RELEASE_VERSION, ожидалась $VERSION"
+}
+
+validate_sha256() {
+    calculated=$("$SHA256_BIN" "$1" 2>/dev/null | awk 'NR == 1 { print $1; exit }') || \
+        die "не удалось вычислить SHA-256 $3"
+    [ "$calculated" = "$2" ] || die "SHA-256 $3 не совпадает с манифестом"
+}
+
+validate_download_size() {
+    downloaded_size=$(wc -c < "$1") || die "не удалось проверить размер $3"
+    [ "$downloaded_size" -gt 0 ] && [ "$downloaded_size" -le "$2" ] || \
+        die "недопустимый размер $3"
 }
 
 ensure_short_command() {
@@ -168,13 +209,29 @@ tmp_watchdog=$REPLY
 make_temp manager
 tmp_manager=$REPLY
 
+command -v "$SHA256_BIN" >/dev/null 2>&1 || die "команда sha256sum не найдена"
+fetch_release_manifest
+release_url="$RAW_REPOSITORY_URL/$RELEASE_COMMIT"
 say "Загружаю WG Watchdog $VERSION..."
-download_file "$WATCHDOG_URL" "$tmp_watchdog" || die "не удалось загрузить watchdog"
-download_file "$MANAGER_URL" "$tmp_manager" || die "не удалось загрузить менеджер"
+download_file "$release_url/wg-watchdog.sh" "$tmp_watchdog" || die "не удалось загрузить watchdog"
+download_file "$release_url/wg-watchdog-manager.sh" "$tmp_manager" || die "не удалось загрузить менеджер"
+validate_download_size "$tmp_watchdog" 131072 watchdog
+validate_download_size "$tmp_manager" 262144 менеджера
 sh -n "$tmp_watchdog" || die "ошибка синтаксиса в загруженном watchdog"
 sh -n "$tmp_manager" || die "ошибка синтаксиса в загруженном менеджере"
 validate_script_version "$tmp_watchdog" watchdog
 validate_script_version "$tmp_manager" менеджер
+validate_sha256 "$tmp_watchdog" "$RELEASE_WATCHDOG_SHA256" watchdog
+validate_sha256 "$tmp_manager" "$RELEASE_MANAGER_SHA256" менеджера
+
+if [ "$FORCE_INSTALL" = yes ] && [ -f "$WATCHDOG_PATH" ] && [ ! -L "$WATCHDOG_PATH" ] && \
+   [ -f "$MANAGER_PATH" ] && [ ! -L "$MANAGER_PATH" ]; then
+    WG_WATCHDOG_LIB_ONLY=no sh "$tmp_manager" --repair || \
+        die "безопасная переустановка не завершена"
+    ensure_short_command
+    show_summary
+    exit 0
+fi
 
 install_if_changed "$tmp_watchdog" "$WATCHDOG_PATH"
 install_if_changed "$tmp_manager" "$MANAGER_PATH"

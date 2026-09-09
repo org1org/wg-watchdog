@@ -503,26 +503,36 @@ assert_contains "$WATCHDOG" 'STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdo
 assert_contains "$WATCHDOG" 'RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"' "RAM lock dir"
 pass "состояние и блокировки по умолчанию размещены в RAM"
 
-# Версии всех распространяемых файлов должны совпадать.
-release_version=$(sed -n '1p' "$VERSION_FILE")
+# Версии исполняемых файлов должны совпадать. Legacy-файл VERSION намеренно
+# остаётся на 1.5.4, чтобы старый менеджер не запустил последовательное обновление.
+legacy_version=$(sed -n '1p' "$VERSION_FILE")
 manager_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$MANAGER" | head -n 1)
 watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$WATCHDOG" | head -n 1)
 installer_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$INSTALLER" | head -n 1)
-assert_equal "$manager_version" "$release_version" "версия менеджера"
-assert_equal "$watchdog_version" "$release_version" "версия watchdog"
-assert_equal "$installer_version" "$release_version" "версия установщика"
-pass "версии распространяемых файлов совпадают"
+assert_equal "$watchdog_version" "$manager_version" "версия watchdog"
+assert_equal "$installer_version" "$manager_version" "версия установщика"
+assert_equal "$legacy_version" 1.5.4 "защитная версия старого канала обновлений"
+pass "версии исполняемых файлов совпадают, старый канал обновлений заморожен"
 
-# Семантическое сравнение и загрузка небольшого файла VERSION.
+# Семантическое сравнение и строгий манифест выпуска.
 version_is_newer 1.10.0 1.9.9 || fail "1.10.0 не распознана как новая версия"
 if version_is_newer 1.2.9 1.3.0; then fail "старая версия распознана как новая"; fi
-printf '1.6.0\n' > "$TEST_ROOT/remote-version"
-VERSION_URL="$TEST_ROOT/remote-version"
+cat > "$TEST_ROOT/remote-release" <<'EOF'
+VERSION=1.7.0
+COMMIT=0123456789abcdef0123456789abcdef01234567
+WATCHDOG_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+MANAGER_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+EOF
+RELEASE_MANIFEST_URL="$TEST_ROOT/remote-release"
 download_file() { cp "$1" "$2"; }
 check_update_status
 assert_equal "$UPDATE_AVAILABLE" yes "доступность обновления"
-assert_equal "$REMOTE_VERSION" 1.6.0 "номер удалённой версии"
-pass "проверка обновлений использует корректное сравнение версий"
+assert_equal "$REMOTE_VERSION" 1.7.0 "номер удалённой версии"
+assert_equal "$REMOTE_COMMIT" 0123456789abcdef0123456789abcdef01234567 "commit выпуска"
+printf 'EXTRA=value\n' >> "$TEST_ROOT/remote-release"
+check_update_status
+assert_equal "$UPDATE_AVAILABLE" unknown "лишнее поле манифеста"
+pass "обновление использует строгий манифест и корректное сравнение версий"
 
 # Короткая команда создаётся только в свободном месте и не затирает коллизию.
 SHORT_COMMAND="$TEST_ROOT/bin-free/wgwm"
@@ -664,24 +674,42 @@ while [ "$#" -gt 0 ]; do
         *) url=$1; shift ;;
     esac
 done
-cp "$MOCK_INSTALL_SOURCE/${url##*/}" "$output"
+if [ "${url##*/}" = RELEASE ]; then
+    cp "$MOCK_RELEASE_FILE" "$output"
+else
+    cp "$MOCK_INSTALL_SOURCE/${url##*/}" "$output"
+fi
 EOF
 chmod 755 "$INSTALL_MOCK_BIN/id" "$INSTALL_MOCK_BIN/wget"
+watchdog_release_hash=$(sha256sum "$WATCHDOG" | awk '{ print $1 }')
+manager_release_hash=$(sha256sum "$MANAGER" | awk '{ print $1 }')
+cat > "$INSTALL_ROOT/RELEASE" <<EOF
+VERSION=1.6.0
+COMMIT=0123456789abcdef0123456789abcdef01234567
+WATCHDOG_SHA256=$watchdog_release_hash
+MANAGER_SHA256=$manager_release_hash
+EOF
 printf '\n' > "$INSTALL_ROOT/answer"
 : > "$INSTALL_ROOT/prompt"
 installer_env() {
     MOCK_INSTALL_SOURCE="$REPO_DIR" \
+    MOCK_RELEASE_FILE="$INSTALL_ROOT/RELEASE" \
     WG_WATCHDOG_OPT_ROOT="$INSTALL_OPT" \
     WG_WATCHDOG_TMP_DIR="$INSTALL_TMP" \
     WG_WATCHDOG_INPUT="$INSTALL_ROOT/answer" \
     WG_WATCHDOG_OUTPUT="$INSTALL_ROOT/prompt" \
     WG_WATCHDOG_OPKG=/bin/true \
+    WG_WATCHDOG_RELEASE_MANIFEST_URL="$INSTALL_ROOT/RELEASE" \
+    WG_WATCHDOG_RAW_REPOSITORY_URL=https://example.invalid \
+    WG_WATCHDOG_RUN_DIR="$INSTALL_ROOT/run" \
+    WG_WATCHDOG_STATE_DIR="$INSTALL_ROOT/state" \
+    WG_WATCHDOG_PATH="$INSTALL_MOCK_BIN:/usr/bin:/bin" \
     WG_WATCHDOG_INSTALL_PATH="$INSTALL_MOCK_BIN:/usr/bin:/bin" \
         sh "$INSTALLER" "$@"
 }
 installer_env > "$INSTALL_ROOT/first-output"
 assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.5.4 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.6.0 установлен.' "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -704,9 +732,9 @@ pass "повторная установочная команда только з
 
 : > "$INSTALL_ROOT/prompt"
 installer_env --force > "$INSTALL_ROOT/force-output"
-assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.5.4"' "принудительная переустановка менеджера"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.6.0"' "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.5.4 установлен.' "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.6.0 установлен.' "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.
@@ -1016,5 +1044,169 @@ pass "каталоги-ссылки отклоняются до удаления
     if (check_managed_directories) > /dev/null 2>&1; then fail "скрыта ошибка ls"; fi
 )
 pass "проверка прав работает без stat -c и отклоняет небезопасные каталоги"
+
+prepare_update_case() {
+    update_name=$1
+    UPDATE_CASE_ROOT="$TEST_ROOT/$update_name"
+    OPT_ROOT="$UPDATE_CASE_ROOT/opt"
+    WATCHDOG_PATH="$OPT_ROOT/bin/wg-watchdog.sh"
+    MANAGER_PATH="$OPT_ROOT/bin/wg-watchdog-manager"
+    UPDATE_DIR="$OPT_ROOT/bin/.wg-watchdog-update"
+    RUN_DIR="$UPDATE_CASE_ROOT/run"
+    TMP_DIR="$UPDATE_CASE_ROOT/tmp"
+    DF_BIN="$UPDATE_CASE_ROOT/df"
+    SYNC_BIN=/bin/true
+    SHA256_BIN=sha256sum
+    mkdir -p "$OPT_ROOT/bin" "$RUN_DIR" "$TMP_DIR"
+    cp "$WATCHDOG" "$WATCHDOG_PATH"
+    cp "$MANAGER" "$MANAGER_PATH"
+    cp "$WATCHDOG_PATH" "$UPDATE_CASE_ROOT/watchdog.expected"
+    cp "$MANAGER_PATH" "$UPDATE_CASE_ROOT/manager.expected"
+    sed 's/^VERSION="[^"]*"/VERSION="9.9.9"/' "$WATCHDOG" > "$UPDATE_CASE_ROOT/watchdog.new"
+    sed 's/^VERSION="[^"]*"/VERSION="9.9.9"/' "$MANAGER" > "$UPDATE_CASE_ROOT/manager.new"
+    cat > "$DF_BIN" <<'EOF'
+#!/bin/sh
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'mock 999999 0 999999 0%% /\n'
+EOF
+    chmod 755 "$DF_BIN" "$WATCHDOG_PATH" "$MANAGER_PATH"
+    MAINTENANCE_HELD=no
+}
+
+# Successful update leaves only the two new live files and no flash cache.
+(
+    prepare_update_case update-success
+    transactional_install "$UPDATE_CASE_ROOT/watchdog.new" "$UPDATE_CASE_ROOT/manager.new" 9.9.9
+    assert_contains "$WATCHDOG_PATH" 'VERSION="9.9.9"' "новый watchdog"
+    assert_contains "$MANAGER_PATH" 'VERSION="9.9.9"' "новый менеджер"
+    [ ! -e "$UPDATE_DIR" ] || fail "каталог транзакции остался после успеха"
+)
+pass "транзакционное обновление заменяет согласованную пару и очищает временные файлы"
+
+# Failure of the second replacement restores both original scripts.
+(
+    prepare_update_case update-second-move-fails
+    mv() {
+        if [ "$1" = "$UPDATE_DIR/manager.new" ] && [ "$2" = "$MANAGER_PATH" ]; then return 1; fi
+        command mv "$@"
+    }
+    if transactional_install "$UPDATE_CASE_ROOT/watchdog.new" "$UPDATE_CASE_ROOT/manager.new" 9.9.9 >/dev/null; then
+        fail "ошибка второй замены скрыта"
+    fi
+    cmp -s "$WATCHDOG_PATH" "$UPDATE_CASE_ROOT/watchdog.expected" || fail "watchdog не восстановлен"
+    cmp -s "$MANAGER_PATH" "$UPDATE_CASE_ROOT/manager.expected" || fail "менеджер не восстановлен"
+    [ ! -e "$UPDATE_DIR" ] || fail "транзакция осталась после успешного отката"
+)
+pass "ошибка замены менеджера откатывает оба файла"
+
+# A durable marker from an interrupted update is recovered on the next start.
+(
+    prepare_update_case update-power-loss
+    mkdir "$UPDATE_DIR"
+    cp "$WATCHDOG_PATH" "$UPDATE_DIR/watchdog.old"
+    cp "$MANAGER_PATH" "$UPDATE_DIR/manager.old"
+    cp "$UPDATE_CASE_ROOT/watchdog.new" "$WATCHDOG_PATH"
+    printf 'watchdog-installed\n' > "$UPDATE_DIR/state"
+    recover_interrupted_update >/dev/null
+    cmp -s "$WATCHDOG_PATH" "$UPDATE_CASE_ROOT/watchdog.expected" || fail "watchdog не восстановлен после обрыва"
+    cmp -s "$MANAGER_PATH" "$UPDATE_CASE_ROOT/manager.expected" || fail "менеджер изменён при восстановлении"
+    [ ! -e "$UPDATE_DIR" ] || fail "маркер обрыва не очищен"
+)
+pass "незавершённое обновление восстанавливается при следующем запуске"
+
+# A committed update only needs cleanup; the new pair must remain active.
+(
+    prepare_update_case update-committed-cleanup
+    mkdir "$UPDATE_DIR"
+    cp "$WATCHDOG_PATH" "$UPDATE_DIR/watchdog.old"
+    cp "$MANAGER_PATH" "$UPDATE_DIR/manager.old"
+    cp "$UPDATE_CASE_ROOT/watchdog.new" "$WATCHDOG_PATH"
+    cp "$UPDATE_CASE_ROOT/manager.new" "$MANAGER_PATH"
+    printf 'committed\n' > "$UPDATE_DIR/state"
+    recover_interrupted_update >/dev/null
+    assert_contains "$WATCHDOG_PATH" 'VERSION="9.9.9"' "watchdog после committed"
+    assert_contains "$MANAGER_PATH" 'VERSION="9.9.9"' "менеджер после committed"
+    [ ! -e "$UPDATE_DIR" ] || fail "завершённая транзакция не очищена"
+)
+pass "подтверждённое обновление сохраняется, а остатки транзакции очищаются"
+
+# Unknown state is never guessed: recovery stops without touching live files.
+(
+    prepare_update_case update-unknown-state
+    mkdir "$UPDATE_DIR"
+    cp "$WATCHDOG_PATH" "$UPDATE_DIR/watchdog.old"
+    cp "$MANAGER_PATH" "$UPDATE_DIR/manager.old"
+    printf 'unexpected-state\n' > "$UPDATE_DIR/state"
+    if recover_interrupted_update >/dev/null 2>&1; then fail "неизвестное состояние принято"; fi
+    cmp -s "$WATCHDOG_PATH" "$UPDATE_CASE_ROOT/watchdog.expected" || fail "watchdog изменён при неизвестном состоянии"
+    cmp -s "$MANAGER_PATH" "$UPDATE_CASE_ROOT/manager.expected" || fail "менеджер изменён при неизвестном состоянии"
+    [ -d "$UPDATE_DIR" ] || fail "диагностические данные неизвестной транзакции удалены"
+)
+pass "неизвестное состояние транзакции останавливает восстановление без догадок"
+
+# The free-space gate runs before any update data is written to /opt.
+(
+    prepare_update_case update-no-space
+    cat > "$DF_BIN" <<'EOF'
+#!/bin/sh
+printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+printf 'mock 1 1 0 100%% /\n'
+EOF
+    chmod 755 "$DF_BIN"
+    if transactional_install "$UPDATE_CASE_ROOT/watchdog.new" "$UPDATE_CASE_ROOT/manager.new" 9.9.9 >/dev/null; then
+        fail "обновление началось без свободного места"
+    fi
+    [ ! -e "$UPDATE_DIR" ] || fail "при нехватке места создан каталог транзакции"
+    cmp -s "$WATCHDOG_PATH" "$UPDATE_CASE_ROOT/watchdog.expected" || fail "watchdog изменён без места"
+)
+pass "нехватка места обнаруживается до записей транзакции"
+
+# A downloaded file with the wrong digest is rejected before maintenance and replacement.
+(
+    prepare_update_case update-bad-hash
+    RAW_REPOSITORY_URL=https://example.invalid
+    REMOTE_COMMIT=0123456789abcdef0123456789abcdef01234567
+    REMOTE_VERSION=9.9.9
+    REMOTE_WATCHDOG_SHA256=0000000000000000000000000000000000000000000000000000000000000000
+    sha256_file "$UPDATE_CASE_ROOT/manager.new"
+    REMOTE_MANAGER_SHA256=$REPLY
+    download_file() {
+        case "$1" in
+            */wg-watchdog.sh) cp "$UPDATE_CASE_ROOT/watchdog.new" "$2" ;;
+            */wg-watchdog-manager.sh) cp "$UPDATE_CASE_ROOT/manager.new" "$2" ;;
+            *) return 1 ;;
+        esac
+    }
+    if (install_program_files) > "$UPDATE_CASE_ROOT/result" 2>&1; then fail "неверный SHA-256 принят"; fi
+    assert_contains "$UPDATE_CASE_ROOT/result" 'SHA-256 watchdog не совпадает' "диагностика хеша"
+    [ ! -e "$UPDATE_DIR" ] || fail "при неверном хеше создана транзакция"
+    cmp -s "$WATCHDOG_PATH" "$UPDATE_CASE_ROOT/watchdog.expected" || fail "watchdog изменён при неверном хеше"
+)
+pass "несовпадение SHA-256 отклоняется до замены файлов"
+
+# An interrupted download is rejected while the installed pair remains untouched.
+(
+    prepare_update_case update-download-fails
+    RAW_REPOSITORY_URL=https://example.invalid
+    REMOTE_COMMIT=0123456789abcdef0123456789abcdef01234567
+    REMOTE_VERSION=9.9.9
+    sha256_file "$UPDATE_CASE_ROOT/watchdog.new"
+    REMOTE_WATCHDOG_SHA256=$REPLY
+    sha256_file "$UPDATE_CASE_ROOT/manager.new"
+    REMOTE_MANAGER_SHA256=$REPLY
+    download_file() {
+        case "$1" in
+            */wg-watchdog.sh) cp "$UPDATE_CASE_ROOT/watchdog.new" "$2" ;;
+            */wg-watchdog-manager.sh) printf '#!/bin/sh\n' > "$2"; return 1 ;;
+            *) return 1 ;;
+        esac
+    }
+    if (install_program_files) > "$UPDATE_CASE_ROOT/result" 2>&1; then fail "обрыв загрузки скрыт"; fi
+    assert_contains "$UPDATE_CASE_ROOT/result" 'не удалось загрузить менеджер' "диагностика обрыва загрузки"
+    [ ! -e "$UPDATE_DIR" ] || fail "при обрыве загрузки создана транзакция"
+    cmp -s "$WATCHDOG_PATH" "$UPDATE_CASE_ROOT/watchdog.expected" || fail "watchdog изменён при обрыве загрузки"
+    cmp -s "$MANAGER_PATH" "$UPDATE_CASE_ROOT/manager.expected" || fail "менеджер изменён при обрыве загрузки"
+)
+pass "обрыв загрузки не затрагивает установленную пару файлов"
 
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"
