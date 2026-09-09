@@ -644,7 +644,7 @@ installer_env() {
 }
 installer_env > "$INSTALL_ROOT/first-output"
 assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.5.2 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.5.3 установлен.' "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -667,9 +667,9 @@ pass "повторная установочная команда только з
 
 : > "$INSTALL_ROOT/prompt"
 installer_env --force > "$INSTALL_ROOT/force-output"
-assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.5.2"' "принудительная переустановка менеджера"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.5.3"' "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.5.2 установлен.' "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.5.3 установлен.' "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.
@@ -942,7 +942,7 @@ pass "ошибка удаления файла явно отмечается к�
 )
 pass "каталоги-ссылки отклоняются до удаления"
 
-# Some Entware mounts expose one mapped UID for the whole /opt filesystem.
+# Keenetic BusyBox stat is built without -c; ls -ldn is available.
 (
     mapped_root="$TEST_ROOT/mapped-owner"
     mkdir -p "$mapped_root/opt/bin" "$mapped_root/opt/etc/wg-watchdog.d"
@@ -952,25 +952,32 @@ pass "каталоги-ссылки отклоняются до удаления
     CONFIG_DIR="$mapped_root/opt/etc/wg-watchdog.d"
     STATE_DIR="$mapped_root/missing-state"
     RUN_DIR="$mapped_root/missing-run"
-    owner_file="$mapped_root/config-owner"
-    printf '1234\n' > "$owner_file"
+    owner_file="$mapped_root/stat-called"
     stat() {
-        if [ "$1" = -c ] && [ "$2" = %u ] && [ "$3" = "$OPT_ROOT/." ]; then
-            return 1
-        elif [ "$1" = -c ] && [ "$2" = %u ] && [ "$3" = "$MANAGER_PATH" ]; then
-            printf '1234\n'
-        elif [ "$1" = -c ] && [ "$2" = %u ] && [ "$3" = "$CONFIG_DIR" ]; then
-            cat "$owner_file"
-        else
-            command stat "$@"
-        fi
+        : > "$owner_file"
+        printf "stat: invalid option -- 'c'\n" >&2
+        return 1
     }
     check_managed_directories
-    printf '1235\n' > "$owner_file"
+    [ ! -e "$owner_file" ] || fail "проверка зависит от stat"
+    chmod 775 "$CONFIG_DIR"
+    if (check_managed_directories) > /dev/null 2>&1; then
+        fail "приняты права записи группы"
+    fi
+    chmod 757 "$CONFIG_DIR"
+    if (check_managed_directories) > /dev/null 2>&1; then
+        fail "приняты права записи остальных"
+    fi
+    chmod 755 "$CONFIG_DIR"
+    ls() { printf 'drwxr-xr-x 2 1234 0 232 Sep 9 11:51 %s\n' "$CONFIG_DIR"; }
     if (check_managed_directories) > /dev/null 2>&1; then
         fail "принят посторонний владелец каталога конфигурации"
     fi
+    ls() { printf 'unrecognized output\n'; }
+    if (check_managed_directories) > /dev/null 2>&1; then fail "приняты неверные метаданные"; fi
+    ls() { return 1; }
+    if (check_managed_directories) > /dev/null 2>&1; then fail "скрыта ошибка ls"; fi
 )
-pass "владелец конфигурации сверяется с менеджером без stat самого /opt"
+pass "проверка прав работает без stat -c и отклоняет небезопасные каталоги"
 
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"

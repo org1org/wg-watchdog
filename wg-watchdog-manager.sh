@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.5.2"
+VERSION="1.5.3"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
@@ -205,17 +205,20 @@ check_managed_directories() {
         [ ! -L "$managed_dir" ] || die "каталог-ссылка не поддерживается: $managed_dir"
         [ -e "$managed_dir" ] || continue
         [ -d "$managed_dir" ] || die "ожидался каталог: $managed_dir"
-        managed_owner=$(stat -c %u "$managed_dir" 2>/dev/null) || \
-            die "не удалось проверить владельца $managed_dir"
-        if [ "$managed_owner" != 0 ]; then
-            opt_owner=$(stat -c %u "$MANAGER_PATH" 2>/dev/null) || \
-                die "не удалось проверить владельца $MANAGER_PATH"
-            [ "$managed_dir" = "$CONFIG_DIR" ] && [ "$managed_owner" = "$opt_owner" ] || \
-                die "владелец каталога отличается от владельца Entware: $managed_dir"
-        fi
-        managed_mode=$(stat -c %a "$managed_dir" 2>/dev/null) || die "не удалось проверить права $managed_dir"
+        # BusyBox builds may omit stat -c. Read only the fixed metadata fields;
+        # directory names (including spaces) are never split or interpreted.
+        managed_listing=$(LC_ALL=C ls -ldn "$managed_dir" 2>/dev/null) || \
+            die "не удалось прочитать права и владельца $managed_dir"
+        managed_meta=$(printf '%s\n' "$managed_listing" | awk '
+            NR == 1 && $1 ~ /^d[rwxstST-]+[.+@]?$/ && length($1) >= 10 &&
+            $3 ~ /^[0-9]+$/ { print substr($1, 1, 10) ":" $3; exit }
+        ')
+        [ -n "$managed_meta" ] || die "не удалось распознать права и владельца $managed_dir"
+        managed_owner=${managed_meta#*:}
+        managed_mode=${managed_meta%%:*}
+        [ "$managed_owner" = 0 ] || die "каталог должен принадлежать root: $managed_dir"
         case "$managed_mode" in
-            *[2367][0-7]|*[0-7][2367]) die "каталог доступен для записи другим пользователям: $managed_dir" ;;
+            ?????w????|????????w?) die "каталог доступен для записи другим пользователям: $managed_dir" ;;
         esac
     done
 }
