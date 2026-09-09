@@ -85,6 +85,7 @@ cleanup() {
 
 acquire_lock() {
     mkdir -p "$RUN_DIR" || return 1
+    [ ! -d "$RUN_DIR/maintenance.lock" ] || return 2
     if mkdir "$LOCK_DIR" 2>/dev/null; then
         if ! printf '%s\n' "$$" > "$LOCK_DIR/pid"; then
             rmdir "$LOCK_DIR" 2>/dev/null || true
@@ -94,24 +95,23 @@ acquire_lock() {
         return 0
     fi
 
-    old_pid=$(sed -n '1p' "$LOCK_DIR/pid" 2>/dev/null)
-    if is_positive_integer "$old_pid" && kill -0 "$old_pid" 2>/dev/null && \
-       [ -r "/proc/$old_pid/cmdline" ] && \
-       tr '\000' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null | \
-           grep -F 'wg-watchdog' >/dev/null 2>&1; then
-        return 2
-    fi
-
-    rm -f "$LOCK_DIR/pid"
-    rmdir "$LOCK_DIR" 2>/dev/null || return 1
-    mkdir "$LOCK_DIR" 2>/dev/null || return 2
-    if ! printf '%s\n' "$$" > "$LOCK_DIR/pid"; then
-        rmdir "$LOCK_DIR" 2>/dev/null || true
-        return 1
-    fi
+    reclaim_stale_lock || return 2
     LOCK_ACQUIRED=yes
     return 0
 }
+
+reclaim_stale_lock() (
+    # Serialize reclamation; an absent PID may belong to a new writer.
+    mkdir "$RUN_DIR/recovery.lock" 2>/dev/null || exit 1
+    trap 'rmdir "$RUN_DIR/recovery.lock" 2>/dev/null || true' EXIT
+    [ ! -d "$RUN_DIR/maintenance.lock" ] || exit 1
+    [ ! -L "$LOCK_DIR" ] || exit 1
+    old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
+    is_positive_integer "$old_pid" || exit 1
+    kill -0 "$old_pid" 2>/dev/null && exit 1
+    rm -f "$LOCK_DIR/pid" && rmdir "$LOCK_DIR" && mkdir "$LOCK_DIR" || exit 1
+    printf '%s\n' "$$" > "$LOCK_DIR/pid"
+)
 
 current_text_time() {
     date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || printf 'неизвестно'
@@ -202,6 +202,9 @@ CONFIG_FILE="$CONFIG_DIR/$REQUESTED_JOB.conf"
 STATE_FILE="$STATE_DIR/$REQUESTED_JOB.state"
 LOCK_DIR="$RUN_DIR/wg-watchdog-$REQUESTED_JOB.lock"
 
+[ ! -d "$RUN_DIR/maintenance.lock" ] || exit 0
+[ ! -e "$RUN_DIR/uninstalled" ] || exit 0
+
 if [ ! -r "$CONFIG_FILE" ]; then
     log_message "[$REQUESTED_JOB] не найден файл настроек $CONFIG_FILE"
     exit 1
@@ -251,6 +254,11 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+# Close the race between the initial maintenance check and mkdir.
+[ ! -d "$RUN_DIR/maintenance.lock" ] || exit 0
+[ ! -e "$RUN_DIR/uninstalled" ] || exit 0
+[ -r "$CONFIG_FILE" ] || exit 0
 
 CURRENT_BOOT_ID=$(sed -n '1p' "$BOOT_ID_FILE" 2>/dev/null)
 [ -n "$CURRENT_BOOT_ID" ] || CURRENT_BOOT_ID="unknown"

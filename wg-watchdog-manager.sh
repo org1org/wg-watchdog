@@ -8,19 +8,20 @@ BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
 MANAGER_URL="$BASE_URL/wg-watchdog-manager.sh"
 VERSION_URL="$BASE_URL/VERSION"
-WATCHDOG_PATH="/opt/bin/wg-watchdog.sh"
-MANAGER_PATH="/opt/bin/wg-watchdog-manager"
-SHORT_COMMAND="/opt/bin/wgwm"
-CONFIG_DIR="/opt/etc/wg-watchdog.d"
-STATE_DIR="/tmp/wg-watchdog"
-RUN_DIR="/tmp/wg-watchdog"
-TMP_DIR="/tmp"
-LEGACY_CONFIG="/opt/etc/wg-watchdog.conf"
-CRONTAB_PATH="/opt/etc/crontab"
-CRON_INIT="/opt/etc/init.d/S10cron"
-NDMC_BIN="ndmc"
-PING_BIN="ping"
-PIDOF_BIN="pidof"
+OPT_ROOT="${WG_WATCHDOG_OPT_ROOT:-/opt}"
+WATCHDOG_PATH="$OPT_ROOT/bin/wg-watchdog.sh"
+MANAGER_PATH="$OPT_ROOT/bin/wg-watchdog-manager"
+SHORT_COMMAND="$OPT_ROOT/bin/wgwm"
+CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-$OPT_ROOT/etc/wg-watchdog.d}"
+STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
+RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
+TMP_DIR="${WG_WATCHDOG_TMP_DIR:-/tmp}"
+LEGACY_CONFIG="$OPT_ROOT/etc/wg-watchdog.conf"
+CRONTAB_PATH="$OPT_ROOT/etc/crontab"
+CRON_INIT="$OPT_ROOT/etc/init.d/S10cron"
+NDMC_BIN="${WG_WATCHDOG_NDMC:-ndmc}"
+PING_BIN="${WG_WATCHDOG_PING:-ping}"
+PIDOF_BIN="${WG_WATCHDOG_PIDOF:-pidof}"
 CRON_BEGIN="# BEGIN WG-WATCHDOG — managed automatically"
 CRON_END="# END WG-WATCHDOG"
 TTY_DEVICE="${WG_WATCHDOG_TTY:-/dev/tty}"
@@ -32,6 +33,83 @@ export PATH
 TMP_FILES=""
 umask 077
 CONSOLE_OPEN=no
+UI_ACTIVE=no
+UI_ROW=1
+UI_ROWS=24
+UI_COLS=80
+MANAGER_LOCK_HELD=no
+MAINTENANCE_HELD=no
+WAIT_SECONDS=20
+SLEEP_BIN=sleep
+JOB_PAGE=0
+
+ui_size() {
+    terminal_size=$(stty size <&3 2>/dev/null || true)
+    set -- $terminal_size
+    UI_ROWS=${1:-24}
+    UI_COLS=${2:-80}
+    case "$UI_ROWS:$UI_COLS" in *[!0-9:]*|0:*|*:0) UI_ROWS=24; UI_COLS=80 ;; esac
+    [ "$UI_ROWS" -ge 12 ] || UI_ROWS=12
+}
+
+ui_start() {
+    [ -t 1 ] && [ -t 3 ] && [ "${TERM:-dumb}" != dumb ] || return 0
+    UI_ACTIVE=yes
+    ui_size
+    printf '\033[?1049h\033[?7l'
+    ui_clear
+}
+
+ui_clear() {
+    [ "$UI_ACTIVE" = yes ] || return 0
+    ui_size
+    printf '\033[2J\033[H'
+    UI_ROW=1
+}
+
+ui_stop() {
+    [ "$UI_ACTIVE" = yes ] || return 0
+    printf '\033[0m\033[?7h\033[?25h\033[?1049l'
+    UI_ACTIVE=no
+}
+
+ui_pause() {
+    [ "$UI_ACTIVE" = yes ] || return 0
+    printf '\033[%s;1H\033[2KEnter — продолжить: ' "$UI_ROWS" >&4
+    IFS= read -r ui_answer <&3 || exit 0
+    ui_clear
+}
+
+ui_text() {
+    # Word wrapping uses byte lengths conservatively on BusyBox awk.
+    # Long unbroken tokens are clipped by the terminal, never split mid-UTF-8.
+    wrapped_text=$(printf '%s\n' "$*" | awk -v width="$((UI_COLS - 2))" '
+        NF == 0 { print ""; next }
+        {
+            line = ""
+            for (i = 1; i <= NF; i++) {
+                if (line != "" && length(line) + length($i) + 1 > width) {
+                    print line; line = ""
+                }
+                line = line (line == "" ? "" : " ") $i
+            }
+            print line
+        }')
+    while IFS= read -r ui_line; do
+        if [ "$UI_ROW" -ge "$((UI_ROWS - 2))" ]; then ui_pause; fi
+        printf '\033[%s;1H\033[2K%s' "$UI_ROW" "$ui_line"
+        UI_ROW=$((UI_ROW + 1))
+    done <<EOF
+$wrapped_text
+EOF
+}
+
+ui_prompt() {
+    [ "$UI_ACTIVE" = yes ] || return 0
+    say "$1"
+    printf '\033[%s;1H\033[2K> ' "$UI_ROW" >&4
+    UI_ROW=$((UI_ROW + 1))
+}
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     COLOR_GREEN=$(printf '\033[1;32m')
@@ -54,14 +132,40 @@ cleanup() {
     done
     TMP_FILES=""
 }
-trap cleanup EXIT
+finish() {
+    cleanup
+    end_maintenance
+    release_manager_lock
+    ui_stop
+}
+trap finish EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-say() { printf '%s\n' "$*"; }
-info() { printf '\n%s%s%s\n\n' "$COLOR_GREEN" "$*" "$COLOR_RESET"; }
-die() { say "Ошибка: $*" >&2; exit 1; }
+release_manager_lock() {
+    [ "$MANAGER_LOCK_HELD" = yes ] || return 0
+    rm -f "$RUN_DIR/manager.lock/pid"
+    rmdir "$RUN_DIR/manager.lock" 2>/dev/null || true
+    MANAGER_LOCK_HELD=no
+}
+
+run_visible() {
+    if [ "$UI_ACTIVE" != yes ]; then "$@"; return $?; fi
+    make_temp command-output
+    command_output=$REPLY
+    command_result=0
+    "$@" > "$command_output" 2>&1 || command_result=$?
+    while IFS= read -r output_line; do say "$output_line"; done < "$command_output"
+    rm -f "$command_output"
+    return "$command_result"
+}
+
+say() {
+    if [ "$UI_ACTIVE" = yes ]; then ui_text "$*"; else printf '%s\n' "$*"; fi
+}
+info() { say "${COLOR_GREEN}$*${COLOR_RESET}"; }
+die() { ui_stop; printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
 
 open_console() {
     if [ "$CONSOLE_OPEN" = "yes" ]; then
@@ -80,10 +184,85 @@ make_temp() {
     REPLY=$tmp_file
 }
 
+acquire_manager_lock() (
+    mkdir -p "$RUN_DIR" || exit 1
+    [ ! -L "$RUN_DIR" ] || exit 1
+    mkdir "$RUN_DIR/manager-recovery.lock" 2>/dev/null || exit 1
+    trap 'rmdir "$RUN_DIR/manager-recovery.lock" 2>/dev/null || true' EXIT
+    if [ -d "$RUN_DIR/manager.lock" ]; then
+        manager_pid=$(cat "$RUN_DIR/manager.lock/pid" 2>/dev/null || true)
+        is_positive_integer "$manager_pid" || exit 1
+        kill -0 "$manager_pid" 2>/dev/null && exit 1
+        rm -f "$RUN_DIR/manager.lock/pid" || exit 1
+        rmdir "$RUN_DIR/manager.lock" || exit 1
+    fi
+    mkdir "$RUN_DIR/manager.lock" 2>/dev/null || exit 1
+    printf '%s\n' "$$" > "$RUN_DIR/manager.lock/pid"
+)
+
+check_managed_directories() {
+    for managed_dir in "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR"; do
+        [ ! -L "$managed_dir" ] || die "каталог-ссылка не поддерживается: $managed_dir"
+        [ -e "$managed_dir" ] || continue
+        [ -d "$managed_dir" ] || die "ожидался каталог: $managed_dir"
+        [ "$(stat -c %u "$managed_dir" 2>/dev/null)" = 0 ] || die "каталог должен принадлежать root: $managed_dir"
+        managed_mode=$(stat -c %a "$managed_dir" 2>/dev/null) || die "не удалось проверить права $managed_dir"
+        case "$managed_mode" in
+            *[2367][0-7]|*[0-7][2367]) die "каталог доступен для записи другим пользователям: $managed_dir" ;;
+        esac
+    done
+}
+
+end_maintenance() {
+    [ "$MAINTENANCE_HELD" = yes ] || return 0
+    rmdir "$RUN_DIR/maintenance.lock" 2>/dev/null || true
+    MAINTENANCE_HELD=no
+}
+
+begin_maintenance() {
+    mkdir -p "$RUN_DIR" || die "не удалось подготовить каталог блокировок"
+    mkdir "$RUN_DIR/maintenance.lock" 2>/dev/null || {
+        say "Уже выполняется обслуживание. Повторите позже."
+        return 1
+    }
+    MAINTENANCE_HELD=yes
+    wait_elapsed=0
+    while :; do
+        active_jobs=no
+        for job_lock in "$RUN_DIR"/wg-watchdog-*.lock; do
+            [ -d "$job_lock" ] || continue
+            [ ! -L "$job_lock" ] || { active_jobs=yes; continue; }
+            worker_pid=$(cat "$job_lock/pid" 2>/dev/null || true)
+            if ! is_positive_integer "$worker_pid" || kill -0 "$worker_pid" 2>/dev/null; then
+                active_jobs=yes
+            else
+                # New workers cannot enter while maintenance.lock exists.
+                rm -f "$job_lock/pid" && rmdir "$job_lock" || active_jobs=yes
+            fi
+        done
+        [ "$active_jobs" = yes ] || return 0
+        if [ "$wait_elapsed" -ge "$WAIT_SECONDS" ]; then
+            end_maintenance
+            say "Проверка ещё выполняется или блокировка не завершена. Изменения отменены."
+            return 1
+        fi
+        [ "$wait_elapsed" -ne 0 ] || info "Ожидаю завершения работающих проверок (до $WAIT_SECONDS сек.)..."
+        "$SLEEP_BIN" 1
+        wait_elapsed=$((wait_elapsed + 1))
+    done
+}
+
+remove_job_files() {
+    valid_interface "$1" || return 1
+    rm -f "$CONFIG_DIR/$1.conf" "$STATE_DIR/$1.state" "$RUN_DIR/wg-watchdog-$1.pid"
+}
+
 read_answer() {
     prompt=$1
     default_value=${2:-}
-    if [ -n "$default_value" ]; then
+    if [ "$UI_ACTIVE" = yes ]; then
+        ui_prompt "$prompt ${default_value:+[$default_value]}"
+    elif [ -n "$default_value" ]; then
         printf '%s [%s]: ' "$prompt" "$default_value" >&4
     else
         printf '%s: ' "$prompt" >&4
@@ -94,7 +273,7 @@ read_answer() {
 }
 
 confirm() {
-    printf '%s [y/N]: ' "$1" >&4
+    if [ "$UI_ACTIVE" = yes ]; then ui_prompt "$1 [y/N]"; else printf '%s [y/N]: ' "$1" >&4; fi
     IFS= read -r answer <&3 || die "не удалось прочитать ответ"
     case "$answer" in
         д|Д|да|Да|ДА|y|Y|yes|YES|Yes) return 0 ;;
@@ -103,7 +282,7 @@ confirm() {
 }
 
 confirm_yes() {
-    printf '%s [Y/n]: ' "$1" >&4
+    if [ "$UI_ACTIVE" = yes ]; then ui_prompt "$1 [Y/n]"; else printf '%s [Y/n]: ' "$1" >&4; fi
     IFS= read -r answer <&3 || die "не удалось прочитать ответ"
     case "$answer" in
         н|Н|нет|Нет|НЕТ|n|N|no|NO|No) return 1 ;;
@@ -254,9 +433,9 @@ ensure_environment() {
     [ -r "$INPUT_DEVICE" ] && [ -w "$OUTPUT_DEVICE" ] || \
         die "менеджер нужно запускать из интерактивного терминала"
     [ "$(id -u 2>/dev/null)" = "0" ] || die "запустите менеджер от пользователя root"
-    [ -d /opt ] || die "каталог /opt отсутствует — сначала установите Entware"
+    [ -d "$OPT_ROOT" ] || die "каталог $OPT_ROOT отсутствует — сначала установите Entware"
     command -v opkg >/dev/null 2>&1 || die "команда opkg не найдена — Entware не запущен"
-    mkdir -p /opt/bin /opt/etc "$TMP_DIR" "$RUN_DIR" "$CONFIG_DIR" "$STATE_DIR" || \
+    mkdir -p "$OPT_ROOT/bin" "$OPT_ROOT/etc" "$TMP_DIR" "$RUN_DIR" "$CONFIG_DIR" "$STATE_DIR" || \
         die "не удалось создать рабочие каталоги"
 
     missing_packages=""
@@ -264,9 +443,9 @@ ensure_environment() {
     [ -x "$CRON_INIT" ] || missing_packages="$missing_packages cron"
     if [ -n "$missing_packages" ]; then
         info "Устанавливаю необходимые пакеты:$missing_packages"
-        opkg update || die "не удалось обновить список пакетов Entware"
+        run_visible opkg update || die "не удалось обновить список пакетов Entware"
         # Only fixed package names assembled above, never user input.
-        opkg install $missing_packages || die "не удалось установить зависимости"
+        run_visible opkg install $missing_packages || die "не удалось установить зависимости"
     fi
 
     if grep -q '^ENABLED=no' "$CRON_INIT" 2>/dev/null; then
@@ -310,9 +489,8 @@ install_program_files() {
 show_update_notice() {
     if [ "$UPDATE_AVAILABLE" = "yes" ]; then
         say ""
-        printf '%s%s\n' "$COLOR_YELLOW" '=============================================='
-        printf '  ДОСТУПНА НОВАЯ ВЕРСИЯ: %s → %s\n' "$VERSION" "$REMOTE_VERSION"
-        printf '%s%s\n\n' '  Выберите обновление в основном меню.' "$COLOR_RESET"
+        say "${COLOR_YELLOW}ДОСТУПНА НОВАЯ ВЕРСИЯ: $VERSION → $REMOTE_VERSION${COLOR_RESET}"
+        say "Выберите обновление в основном меню."
     elif [ "$UPDATE_AVAILABLE" = "unknown" ]; then
         say "Обновления проверить не удалось; локальное управление доступно."
     fi
@@ -334,6 +512,8 @@ perform_update() {
     install_program_files
     info "Обновление установлено. Перезапускаю менеджер..."
     cleanup
+    ui_stop
+    release_manager_lock
     exec "$MANAGER_PATH" --after-update
     die "не удалось запустить обновлённый менеджер"
 }
@@ -379,10 +559,12 @@ choose_interface() {
         say "Доступные WireGuard-интерфейсы:"
         index=1
         default_index=1
-        printf '%s\n' "$INTERFACE_LIST" | while IFS="$(printf '\t')" read -r iface description; do
-            printf '  %s) %s — %s\n' "$index" "$iface" "$description"
+        while IFS="$(printf '\t')" read -r iface description; do
+            say "  $index) $iface — $description"
             index=$((index + 1))
-        done
+        done <<EOF
+$INTERFACE_LIST
+EOF
         if [ -n "$current" ]; then
             default_index=$(printf '%s\n' "$INTERFACE_LIST" | awk -F '\t' -v wanted="$current" '
                 $1 == wanted { print NR; found = 1; exit }
@@ -469,13 +651,14 @@ detect_peer_defaults() {
     peer_index=1
     if [ "$peer_count" -gt 1 ]; then
         say "Найдено несколько пиров выбранного интерфейса:"
-        printf '%s\n' "$PEER_LIST" | while IFS="$(printf '\t')" read -r endpoint tunnel_ip peer_label; do
+        while IFS="$(printf '\t')" read -r endpoint tunnel_ip peer_label; do
             [ "$endpoint" = "-" ] && endpoint="внешний адрес не найден"
             [ "$tunnel_ip" = "-" ] && tunnel_ip="внутренний адрес не найден"
-            printf '  %s) peer %s… — %s; %s\n' \
-                "$peer_index" "$peer_label" "$endpoint" "$tunnel_ip"
+            say "  $peer_index) peer $peer_label… — $endpoint; $tunnel_ip"
             peer_index=$((peer_index + 1))
-        done
+        done <<EOF
+$PEER_LIST
+EOF
         while :; do
             read_answer "Выберите пир WG-сервера" "1"
             if is_positive_integer "$REPLY" && [ "$REPLY" -le "$peer_count" ]; then
@@ -863,9 +1046,15 @@ build_job_index() {
         interface_description "$WG_INTERFACE"
         description=$REPLY
         if [ "$ENABLED" = "yes" ]; then state="включено"; else state="выключено"; fi
-        printf '  %s%s. %s — %s; сервер %s; каждые %s мин.; %s%s\n' \
-            "$COLOR_GREEN" "$count" "$WG_INTERFACE" "$description" \
-            "$WG_SERVER_TUNNEL_IP" "$CHECK_INTERVAL" "$state" "$COLOR_RESET"
+        if [ "$UI_ACTIVE" = yes ]; then
+            if [ "$count" -gt "$((JOB_PAGE * 3))" ] && [ "$count" -le "$((JOB_PAGE * 3 + 3))" ]; then
+                say "$COLOR_GREEN$count. $WG_INTERFACE — $state$COLOR_RESET"
+            fi
+        else
+            printf '  %s%s. %s — %s; сервер %s; каждые %s мин.; %s%s\n' \
+                "$COLOR_GREEN" "$count" "$WG_INTERFACE" "$description" \
+                "$WG_SERVER_TUNNEL_IP" "$CHECK_INTERVAL" "$state" "$COLOR_RESET"
+        fi
     done
     JOB_COUNT=$count
 }
@@ -901,11 +1090,13 @@ toggle_job() {
 delete_job() {
     select_job "Какое задание удалить" || return
     confirm "Удалить задание $SELECTED_JOB и его настройки?" || return 0
-    rm -f "$CONFIG_DIR/$SELECTED_JOB.conf" "$STATE_DIR/$SELECTED_JOB.state" \
-        "$RUN_DIR/wg-watchdog-$SELECTED_JOB.pid"
-    rm -f "$RUN_DIR/wg-watchdog-$SELECTED_JOB.lock/pid"
-    rmdir "$RUN_DIR/wg-watchdog-$SELECTED_JOB.lock" 2>/dev/null || true
-    rewrite_crontab || die "не удалось обновить cron"
+    begin_maintenance || return 0
+    load_config "$CONFIG_DIR/$SELECTED_JOB.conf"
+    ENABLED=no
+    write_config
+    rewrite_crontab || die "задание отключено, но cron не обновлён"
+    remove_job_files "$SELECTED_JOB" || die "удаление не завершено: часть файлов осталась"
+    end_maintenance
     say "Задание $SELECTED_JOB удалено."
 }
 
@@ -941,7 +1132,7 @@ show_job_status() {
 run_job_now() {
     select_job "Какое задание проверить сейчас" || return
     say "Запускаю проверку $SELECTED_JOB..."
-    "$WATCHDOG_PATH" --job "$SELECTED_JOB" --force
+    run_visible "$WATCHDOG_PATH" --job "$SELECTED_JOB" --force
     result=$?
     if [ "$result" -eq 0 ]; then
         say "Проверка завершена. Подробности перезапусков: logread | grep wg-watchdog"
@@ -969,37 +1160,43 @@ remove_managed_cron() {
 }
 
 uninstall_program() {
+    check_managed_directories
     say ""
     say "Будут удалены программа, все задания WG Watchdog, их состояние и строки cron."
     say "Пакеты Entware cron и ndmq останутся: они могут использоваться другими программами."
     confirm "Полностью удалить WG Watchdog?" || return 0
-
+    begin_maintenance || return 0
     remove_managed_cron
+    : > "$RUN_DIR/uninstalled" || die "не удалось заблокировать отложенные запуски"
     for file in "$CONFIG_DIR"/*.conf; do
-        [ -f "$file" ] && rm -f "$file"
+        [ -f "$file" ] || continue
+        remove_id=${file##*/}
+        remove_id=${remove_id%.conf}
+        valid_interface "$remove_id" || continue
+        remove_job_files "$remove_id" || die "удаление не завершено: часть файлов осталась"
     done
-    for file in "$STATE_DIR"/*.state "$RUN_DIR"/*.pid; do
-        [ -f "$file" ] && rm -f "$file"
-    done
-    for lock_dir in "$RUN_DIR"/wg-watchdog-*.lock; do
-        [ -d "$lock_dir" ] || continue
-        rm -f "$lock_dir/pid"
-        rmdir "$lock_dir" 2>/dev/null || true
-    done
+    rm -f "$LEGACY_CONFIG" || die "не удалось удалить прежнюю конфигурацию"
     rmdir "$CONFIG_DIR" 2>/dev/null || true
     rmdir "$STATE_DIR" 2>/dev/null || true
     if [ "$RUN_DIR" != "$STATE_DIR" ]; then
         rmdir "$RUN_DIR" 2>/dev/null || true
     fi
+    rm -f "$WATCHDOG_PATH" || die "удаление не завершено: watchdog остался; менеджер сохранён"
+    rm -f "$MANAGER_PATH" || die "удаление не завершено: менеджер остался"
     if [ -L "$SHORT_COMMAND" ] && [ "$(readlink "$SHORT_COMMAND" 2>/dev/null)" = "$MANAGER_PATH" ]; then
-        rm -f "$SHORT_COMMAND"
+        rm -f "$SHORT_COMMAND" || die "программа удалена, но не удалось удалить ссылку wgwm"
     fi
-    rm -f "$WATCHDOG_PATH" "$MANAGER_PATH"
+    ui_stop
     say "WG Watchdog удалён. Сторонние задания cron сохранены."
     exit 0
 }
 
 show_header() {
+    if [ "$UI_ACTIVE" = yes ]; then
+        say "${COLOR_CYAN}WG WATCHDOG  /  $VERSION${COLOR_RESET}"
+        say "Автор: $AUTHOR · Контроль WireGuard"
+        return 0
+    fi
     say ""
     printf '%s%s%s\n' "$COLOR_CYAN" 'WG Watchdog Manager' "$COLOR_RESET"
     say "Контролирует доступность WG-сервера и автоматически перезапускает"
@@ -1010,14 +1207,25 @@ show_header() {
 
 show_detected_interfaces() {
     detect_interfaces
-    say "Найденные WireGuard-интерфейсы:"
+    if [ "$UI_ACTIVE" = yes ] && [ "${1:-}" != all ]; then
+        say "Интерфейсы (первые два):"
+    else
+        say "Найденные WireGuard-интерфейсы:"
+    fi
     if [ -z "$INTERFACE_LIST" ]; then
         say "  Не найдены. При добавлении задания имя можно будет ввести вручную."
         return 0
     fi
-    printf '%s\n' "$INTERFACE_LIST" | while IFS="$(printf '\t')" read -r iface description; do
-        printf '  • %s — %s\n' "$iface" "$description"
-    done
+    interface_shown=0
+    while IFS="$(printf '\t')" read -r iface description; do
+        interface_shown=$((interface_shown + 1))
+        if [ "$UI_ACTIVE" = yes ] && [ "${1:-}" != all ] && [ "$interface_shown" -gt 2 ]; then
+            break
+        fi
+        say "  • $iface — $description"
+    done <<EOF
+$INTERFACE_LIST
+EOF
 }
 
 show_update_menu_item() {
@@ -1031,11 +1239,24 @@ show_update_menu_item() {
 main_menu() {
     while :; do
         cleanup
-        say ""
+        if [ "$UI_ACTIVE" = yes ]; then
+            ui_clear
+            show_header
+            if [ "$UPDATE_AVAILABLE" = yes ]; then
+                say "${COLOR_YELLOW}Доступно обновление: $REMOTE_VERSION${COLOR_RESET}"
+            fi
+            show_detected_interfaces
+        fi
+        [ "$UI_ACTIVE" = yes ] || say ""
         say "Настроенные задания:"
         build_job_index
+        if [ "$UI_ACTIVE" = yes ] && [ "$JOB_COUNT" -gt 3 ]; then
+            say "n) Следующие задания · i) Интерфейсы"
+        elif [ "$UI_ACTIVE" = yes ]; then
+            say "i) Все интерфейсы"
+        fi
         [ "$JOB_COUNT" -gt 0 ] || say "  Нет настроенных заданий."
-        say ""
+        [ "$UI_ACTIVE" = yes ] || say ""
         if [ "$JOB_COUNT" -eq 0 ]; then
             say "  1) Добавить задание"
             show_update_menu_item 2
@@ -1053,6 +1274,23 @@ main_menu() {
             say "  0) Выход"
         fi
         read_answer "Выберите действие" "0"
+        if [ "$UI_ACTIVE" = yes ] && [ "$REPLY" = i ]; then
+            ui_clear
+            show_detected_interfaces all
+            ui_pause
+            continue
+        fi
+        if [ "$UI_ACTIVE" = yes ] && [ "$REPLY" = n ] && [ "$JOB_COUNT" -gt 3 ]; then
+            JOB_PAGE=$(((JOB_PAGE + 1) % ((JOB_COUNT + 2) / 3)))
+            continue
+        fi
+        if [ "$REPLY" != 0 ] && [ "$UI_ACTIVE" = yes ]; then
+            # Preserve the selected action while repainting the action screen.
+            menu_action=$REPLY
+            ui_clear
+            show_header
+            REPLY=$menu_action
+        fi
         if [ "$JOB_COUNT" -eq 0 ]; then
             case "$REPLY" in
                 1) configure_job add "" ;;
@@ -1061,6 +1299,8 @@ main_menu() {
                 0) return 0 ;;
                 *) say "Неизвестный пункт меню." ;;
             esac
+            ui_pause
+            JOB_PAGE=0
             continue
         fi
         case "$REPLY" in
@@ -1077,6 +1317,8 @@ main_menu() {
             0) return 0 ;;
             *) say "Неизвестный пункт меню." ;;
         esac
+        ui_pause
+        JOB_PAGE=0
     done
 }
 
@@ -1086,13 +1328,26 @@ fi
 
 case "${1:-}" in
     --from-installer|--after-update) ;;
+    --uninstall) ;;
+    --plain) ;;
     '') ;;
     *) die "неизвестный параметр: $1" ;;
 esac
+[ "$#" -le 1 ] || die "ожидался один параметр"
 
 [ -r "$INPUT_DEVICE" ] && [ -w "$OUTPUT_DEVICE" ] || \
     die "менеджер нужно запускать из интерактивного терминала"
 open_console
+if [ "${1:-}" != --plain ]; then ui_start; fi
+[ "$(id -u)" = 0 ] || die "требуются права root"
+check_managed_directories
+acquire_manager_lock || die "менеджер уже запущен или его блокировка не завершена; закройте другую сессию"
+MANAGER_LOCK_HELD=yes
+if [ "${1:-}" = --uninstall ]; then
+    uninstall_program
+    exit 0
+fi
+rm -f "$RUN_DIR/uninstalled"
 show_header
 ensure_environment
 cleanup_legacy_state

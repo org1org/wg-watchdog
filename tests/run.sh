@@ -575,12 +575,13 @@ TMP_DIR="$UNINSTALL_ROOT/tmp"
 CRONTAB_PATH="$UNINSTALL_ROOT/crontab"
 CRON_INIT=/bin/true
 WATCHDOG_PATH="$UNINSTALL_ROOT/bin/wg-watchdog.sh"
+LEGACY_CONFIG="$UNINSTALL_ROOT/legacy.conf"
 MANAGER_PATH="$UNINSTALL_ROOT/bin/wg-watchdog-manager"
 SHORT_COMMAND="$UNINSTALL_ROOT/bin/wgwm"
 mkdir -p "$CONFIG_DIR" "$STATE_DIR/wg-watchdog-Wireguard0.lock" "$TMP_DIR" "$UNINSTALL_ROOT/bin"
 : > "$CONFIG_DIR/Wireguard0.conf"
 : > "$STATE_DIR/Wireguard0.state"
-: > "$STATE_DIR/wg-watchdog-Wireguard0.lock/pid"
+printf '99999999\n' > "$STATE_DIR/wg-watchdog-Wireguard0.lock/pid"
 : > "$WATCHDOG_PATH"
 : > "$MANAGER_PATH"
 ln -s "$MANAGER_PATH" "$SHORT_COMMAND"
@@ -793,5 +794,152 @@ assert_contains "$MOCK_DIR/ndmc.log" 'interface Wireguard0 up' "аварийно
 assert_equal "$(wc -l < "$MOCK_DIR/sleep.log" | tr -d ' ')" 1 "отсутствие продолжения после TERM"
 [ ! -d "$RUN_DIR/wg-watchdog-Wireguard0.lock" ] || fail "блокировка осталась после TERM"
 pass "TERM завершает watchdog и пытается вернуть интерфейс в up"
+
+# A live manager lock excludes another manager; dead known owners can recover.
+(
+    RUN_DIR="$TEST_ROOT/manager-locks"
+    acquire_manager_lock || fail "первый менеджер не получил блокировку"
+    if acquire_manager_lock; then fail "второй менеджер получил живую блокировку"; fi
+    printf '99999999\n' > "$RUN_DIR/manager.lock/pid"
+    acquire_manager_lock || fail "блокировка завершённого менеджера не восстановлена"
+    MANAGER_LOCK_HELD=yes
+    release_manager_lock
+    [ ! -d "$RUN_DIR/manager.lock" ] || fail "блокировка менеджера не освобождена"
+)
+pass "блокировка исключает второго менеджера и восстанавливается после известного мёртвого PID"
+
+# Maintenance timeout must preserve a live worker lock and all settings.
+(
+    RUN_DIR="$TEST_ROOT/maintenance-live"
+    mkdir -p "$RUN_DIR/wg-watchdog-Wireguard0.lock"
+    printf '%s\n' "$$" > "$RUN_DIR/wg-watchdog-Wireguard0.lock/pid"
+    WAIT_SECONDS=0
+    if begin_maintenance >/dev/null; then fail "обслуживание разрешено при живом процессе"; fi
+    [ -f "$RUN_DIR/wg-watchdog-Wireguard0.lock/pid" ] || fail "живая блокировка удалена"
+    [ ! -d "$RUN_DIR/maintenance.lock" ] || fail "барьер остался после отказа"
+)
+pass "обслуживание не удаляет блокировку живого процесса"
+
+# Maintenance barrier suppresses new worker activity and logging.
+new_case
+load_config "$MANAGER_ROOT/config/Wireguard0.conf"
+write_config
+mkdir "$RUN_DIR/maintenance.lock"
+run_watchdog tunnel_down 16000 --force > /dev/null
+assert_empty "$MOCK_DIR/ping.log" "ping во время обслуживания"
+assert_empty "$MOCK_DIR/ndmc.log" "ndmc во время обслуживания"
+rmdir "$RUN_DIR/maintenance.lock"
+pass "новые проверки не запускаются во время обслуживания"
+
+# An incomplete lock must not be mistaken for an abandoned lock.
+mkdir "$RUN_DIR/wg-watchdog-Wireguard0.lock"
+run_watchdog tunnel_down 16000 --force > /dev/null
+[ -d "$RUN_DIR/wg-watchdog-Wireguard0.lock" ] || fail "незавершённая блокировка захвачена другим процессом"
+assert_empty "$MOCK_DIR/ndmc.log" "перезапуск при незавершённой блокировке"
+rmdir "$RUN_DIR/wg-watchdog-Wireguard0.lock"
+pass "отсутствие PID не разрешает захват чужой блокировки"
+
+# A delayed cron command after uninstall must exit without reading a config.
+: > "$RUN_DIR/uninstalled"
+rm -f "$CONFIG_DIR/Wireguard0.conf"
+run_watchdog tunnel_down 16000 --force > /dev/null
+assert_empty "$MOCK_DIR/logger.log" "ошибка конфигурации после удаления"
+pass "отложенный cron тихо завершается после удаления"
+
+# Direct uninstall must bypass package installation and work without opkg.
+(
+    direct_root="$TEST_ROOT/direct-uninstall"
+    mkdir -p "$direct_root/opt/bin" "$direct_root/opt/etc/wg-watchdog.d" "$direct_root/run"
+    cp "$WATCHDOG" "$direct_root/opt/bin/wg-watchdog.sh"
+    cp "$MANAGER" "$direct_root/opt/bin/wg-watchdog-manager"
+    printf '%s\n' '17 * * * * root /opt/bin/foreign-task' > "$direct_root/opt/etc/crontab"
+    printf 'yes\n' > "$direct_root/input"
+    : > "$direct_root/output"
+    WG_WATCHDOG_LIB_ONLY=no \
+    WG_WATCHDOG_OPT_ROOT="$direct_root/opt" \
+    WG_WATCHDOG_RUN_DIR="$direct_root/run" \
+    WG_WATCHDOG_STATE_DIR="$direct_root/run" \
+    WG_WATCHDOG_INPUT="$direct_root/input" \
+    WG_WATCHDOG_OUTPUT="$direct_root/output" \
+        sh "$MANAGER" --uninstall > "$direct_root/result"
+    [ ! -e "$direct_root/opt/bin/wg-watchdog-manager" ] || fail "прямое удаление не удалило менеджер"
+    assert_contains "$direct_root/result" 'WG Watchdog удалён' "результат прямого удаления"
+    assert_contains "$direct_root/opt/etc/crontab" 'foreign-task' "чужой cron"
+)
+pass "прямое удаление работает без opkg и установки зависимостей"
+
+# Cancel an uninstall with a live worker before touching cron or program files.
+(
+    TMP_FILES=""
+    trap cleanup EXIT
+    prepare_dialog_case blocked-uninstall
+    WATCHDOG_PATH="$DIALOG_ROOT/watchdog"
+    MANAGER_PATH="$DIALOG_ROOT/manager"
+    : > "$WATCHDOG_PATH"
+    : > "$MANAGER_PATH"
+    printf 'foreign cron\n' > "$CRONTAB_PATH"
+    mkdir -p "$RUN_DIR/wg-watchdog-Wireguard0.lock"
+    printf '%s\n' "$$" > "$RUN_DIR/wg-watchdog-Wireguard0.lock/pid"
+    printf 'yes\n' > "$INPUT_DEVICE"
+    open_console
+    WAIT_SECONDS=0
+    uninstall_program > "$DIALOG_ROOT/result"
+    [ -e "$MANAGER_PATH" ] && [ -e "$WATCHDOG_PATH" ] || fail "удалены файлы живого задания"
+    assert_contains "$CRONTAB_PATH" 'foreign cron' "cron при отказе удаления"
+    assert_contains "$DIALOG_ROOT/result" 'Изменения отменены' "отказ удаления занятого задания"
+)
+pass "удаление при живом задании сохраняет cron и программу"
+
+# End of an active worker during the bounded wait permits maintenance.
+(
+    RUN_DIR="$TEST_ROOT/maintenance-finishes"
+    mkdir -p "$RUN_DIR/wg-watchdog-Wireguard0.lock"
+    printf '%s\n' "$$" > "$RUN_DIR/wg-watchdog-Wireguard0.lock/pid"
+    WAIT_SECONDS=1
+    simulated_finish() {
+        rm -f "$RUN_DIR/wg-watchdog-Wireguard0.lock/pid"
+        rmdir "$RUN_DIR/wg-watchdog-Wireguard0.lock"
+    }
+    SLEEP_BIN=simulated_finish
+    begin_maintenance > /dev/null || fail "обслуживание не дождалось завершения"
+    [ -d "$RUN_DIR/maintenance.lock" ] || fail "барьер снят слишком рано"
+    end_maintenance
+)
+pass "обслуживание продолжает работу после завершения активного задания"
+
+# A failed file removal must not be reported as success.
+(
+    prepare_dialog_case failed-uninstall
+    WATCHDOG_PATH="$DIALOG_ROOT/watchdog"
+    MANAGER_PATH="$DIALOG_ROOT/manager"
+    LEGACY_CONFIG="$DIALOG_ROOT/legacy"
+    SHORT_COMMAND="$DIALOG_ROOT/wgwm"
+    : > "$WATCHDOG_PATH"
+    : > "$MANAGER_PATH"
+    printf 'yes\n' > "$INPUT_DEVICE"
+    open_console
+    rm() {
+        for remove_arg in "$@"; do
+            [ "$remove_arg" != "$WATCHDOG_PATH" ] || return 1
+        done
+        command rm "$@"
+    }
+    if (trap finish EXIT; uninstall_program) > "$DIALOG_ROOT/output" 2>&1; then
+        fail "ошибка удаления скрыта"
+    fi
+    assert_contains "$DIALOG_ROOT/output" 'удаление не завершено' "частичное удаление"
+    if grep -F 'WG Watchdog удалён.' "$DIALOG_ROOT/output" >/dev/null; then fail "ложный успех удаления"; fi
+)
+pass "ошибка удаления файла явно отмечается как незавершённое удаление"
+
+# Directory symlinks cannot redirect uninstall to someone else's files.
+(
+    protected_root="$TEST_ROOT/protected-directory"
+    mkdir -p "$protected_root/foreign"
+    ln -s "$protected_root/foreign" "$protected_root/config"
+    CONFIG_DIR="$protected_root/config"
+    if (check_managed_directories) > /dev/null 2>&1; then fail "принят каталог-ссылка"; fi
+)
+pass "каталоги-ссылки отклоняются до удаления"
 
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"

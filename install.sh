@@ -118,7 +118,8 @@ show_summary() {
     say "  Запустить и настроить:  $run_command"
     say "  Принудительно переустановить:"
     say "    wget -qO- $BASE_URL/install.sh | sh -s -- --force"
-    say "  Удалить: запустите $run_command и выберите «Удалить WG Watchdog»."
+    say "  Удалить программу:      $run_command --uninstall"
+    say "  Обычный текстовый режим: $run_command --plain"
     say ""
     say "При первом запуске wgwm при необходимости установит ndmq и cron."
 }
