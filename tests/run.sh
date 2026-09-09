@@ -68,6 +68,7 @@ write_config() {
     public=$2
     threshold=$3
     enabled=$4
+    internet_check=${5:-yes}
     cat > "$CONFIG_DIR/Wireguard0.conf" <<EOF
 JOB_ID='Wireguard0'
 WG_INTERFACE='Wireguard0'
@@ -77,6 +78,7 @@ PING_COUNT='3'
 PING_TIMEOUT='3'
 RESTART_DELAY='3'
 CHECK_INTERVAL='5'
+INTERNET_CHECK='$internet_check'
 FAILURE_THRESHOLD='$threshold'
 RESTART_COOLDOWN='30'
 BOOT_GRACE='180'
@@ -114,7 +116,7 @@ load_test_state() {
 # Пауза после загрузки.
 new_case
 write_config 10.0.0.1 "" 2 yes
-printf '100.00 0.00\n' > "$CASE_DIR/uptime"
+printf '0.25 0.00\n' > "$CASE_DIR/uptime"
 run_watchdog healthy 1000 --force >/dev/null
 load_test_state
 assert_equal "$LAST_RESULT" "пауза после загрузки роутера" "boot grace"
@@ -151,6 +153,7 @@ new_case
 write_config 10.0.0.1 "" 1 yes
 run_watchdog tunnel_down 4000 --force >/dev/null
 : > "$MOCK_DIR/ndmc.log"
+printf '1060.00 0.00\n' > "$CASE_DIR/uptime"
 run_watchdog tunnel_down 4060 --force >/dev/null
 load_test_state
 assert_contains "$STATE_DIR/Wireguard0.state" "LAST_RESULT='cooldown" "состояние cooldown"
@@ -159,6 +162,7 @@ pass "cooldown ограничивает повторные перезапуск�
 
 # После завершения cooldown перезапуск снова разрешён.
 : > "$MOCK_DIR/ndmc.log"
+printf '2861.00 0.00\n' > "$CASE_DIR/uptime"
 run_watchdog tunnel_down 5801 --force >/dev/null
 assert_contains "$MOCK_DIR/ndmc.log" "interface Wireguard0 down" "restart после cooldown"
 pass "после окончания cooldown восстановление снова разрешено"
@@ -175,10 +179,33 @@ assert_empty "$MOCK_DIR/ndmc.log" "без интернета restart не нуж
 pass "отсутствие интернета корректно отделяется от ошибки WG"
 
 # Одинаковая длительная ошибка пишется в системный журнал только один раз.
-run_watchdog internet_down 5600 --force >/dev/null
+run_watchdog internet_down 5600 --force > "$CASE_DIR/manual-repeat"
 internet_log_count=$(grep -c 'интернет недоступен' "$MOCK_DIR/logger.log" || true)
 assert_equal "$internet_log_count" 1 "подавление повторного логирования"
+assert_contains "$CASE_DIR/manual-repeat" 'интернет недоступен' "результат ручной проверки"
 pass "повторяющееся состояние не засоряет системный журнал"
+
+# Full-tunnel jobs can disable probes which might themselves use WireGuard.
+new_case
+write_config 10.0.0.1 "" 1 yes no
+run_watchdog internet_and_tunnel_down 5700 --force >/dev/null
+assert_contains "$MOCK_DIR/ndmc.log" "interface Wireguard0 down" "full-tunnel restart"
+if grep -F '1.1.1.1' "$MOCK_DIR/ping.log" >/dev/null || \
+   grep -F '8.8.8.8' "$MOCK_DIR/ping.log" >/dev/null; then
+    fail "выключенная проверка интернета всё равно отправила ping"
+fi
+pass "выключенная внешняя проверка не блокирует восстановление full-tunnel"
+
+# Monotonic uptime, not a backward wall-clock correction, controls cooldown.
+new_case
+write_config 10.0.0.1 "" 1 yes no
+run_watchdog tunnel_down 10000 --force >/dev/null
+: > "$MOCK_DIR/ndmc.log"
+printf '1060.00 0.00\n' > "$CASE_DIR/uptime"
+run_watchdog tunnel_down 100 --force >/dev/null
+assert_empty "$MOCK_DIR/ndmc.log" "перевод часов назад обошёл cooldown"
+assert_contains "$STATE_DIR/Wireguard0.state" "LAST_RESULT='cooldown" "монотонный cooldown"
+pass "перевод системных часов назад не отменяет cooldown"
 
 # Недоступный публичный сервер блокирует restart.
 new_case
@@ -250,6 +277,17 @@ if run_watchdog tunnel_down 12000 --force >/dev/null; then
 fi
 assert_empty "$MOCK_DIR/ndmc.log" "ошибочная конфигурация не должна вызывать ndmc"
 pass "опасные числовые значения отклоняются"
+
+# Неизвестный режим внешней проверки не должен молча менять сетевую логику.
+new_case
+write_config 10.0.0.1 "" 2 yes no
+sed -i "s/INTERNET_CHECK='no'/INTERNET_CHECK='maybe'/" "$CONFIG_DIR/Wireguard0.conf"
+if run_watchdog healthy 7100 --force >/dev/null; then
+    fail "неизвестный режим проверки интернета принят"
+fi
+assert_contains "$MOCK_DIR/logger.log" 'недопустимый режим проверки интернета' "валидация INTERNET_CHECK"
+assert_empty "$MOCK_DIR/ndmc.log" "ошибочная настройка не должна перезапускать интерфейс"
+pass "неизвестный режим внешней проверки отклоняется"
 
 # Чистые функции менеджера: интервалы и cron-выражения.
 WG_WATCHDOG_LIB_ONLY=yes
@@ -325,6 +363,26 @@ open_console
 confirm "Использовать публичную проверку" || fail "ответ yes не принят"
 pass "подтверждения используют yes/no и безопасные значения по умолчанию"
 
+# Full-screen confirmation is placed directly below the action result.
+(
+    printf '\n' > "$TEST_ROOT/pause-answer"
+    : > "$TEST_ROOT/pause-output"
+    INPUT_DEVICE="$TEST_ROOT/pause-answer"
+    OUTPUT_DEVICE="$TEST_ROOT/pause-output"
+    open_console
+    UI_ACTIVE=yes
+    UI_ROW=5
+    UI_ROWS=24
+    ui_pause >/dev/null
+    near_result=$(printf '\033[6;1H\033[2KНажмите Enter, чтобы продолжить: ')
+    bottom_prompt=$(printf '\033[24;1H\033[2KНажмите Enter, чтобы продолжить: ')
+    assert_contains "$TEST_ROOT/pause-output" "$near_result" "положение подтверждения"
+    if grep -F "$bottom_prompt" "$TEST_ROOT/pause-output" >/dev/null; then
+        fail "подтверждение осталось у нижней границы терминала"
+    fi
+)
+pass "подтверждение Enter показывается под основным текстом"
+
 # Полный диалог создания задания: Enter оставляет публичную проверку выключенной.
 prepare_dialog_case() {
     dialog_name=$1
@@ -357,6 +415,7 @@ assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP=''" "публ
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "PING_COUNT='3'" "PING_COUNT по умолчанию"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "CHECK_INTERVAL='5'" "CHECK_INTERVAL по умолчанию"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "порог по умолчанию"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='no'" "безопасный режим full-tunnel"
 if grep -F 'PING_COUNT —' "$OUTPUT_DEVICE" >/dev/null || \
    grep -F 'CHECK_INTERVAL —' "$OUTPUT_DEVICE" >/dev/null; then
     fail "при создании задания запрошены числовые параметры"
@@ -366,7 +425,7 @@ assert_contains "$DIALOG_ROOT/output" 'Изменить эти значения 
 pass "новое задание получает рекомендуемые параметры без лишних вопросов"
 
 # Редактирование существующего задания не спрашивает интерфейс повторно.
-printf '\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
 open_console
 configure_job edit Wireguard0 >/dev/null
 if grep -F 'Выберите номер интерфейса' "$OUTPUT_DEVICE" >/dev/null; then
@@ -408,7 +467,8 @@ upgrade_config_files >/dev/null
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "миграция FAILURE_THRESHOLD"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "RESTART_COOLDOWN='30'" "миграция cooldown"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "CHECK_INTERVAL='5'" "нормализация интервала"
-pass "конфигурация v1.1 автоматически обновляется до v1.2"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='yes'" "сохранение прежней сетевой логики"
+pass "старая конфигурация обновляется без молчаливой смены сетевой логики"
 
 # Повторный запуск миграции не перезаписывает неизменившийся файл на /opt.
 config_inode_before=$(ls -i "$CONFIG_DIR/Wireguard0.conf" | awk '{ print $1 }')
@@ -433,6 +493,7 @@ PING_COUNT=3
 PING_TIMEOUT=3
 RESTART_DELAY=3
 CHECK_INTERVAL=10
+INTERNET_CHECK=no
 FAILURE_THRESHOLD=2
 RESTART_COOLDOWN=30
 BOOT_GRACE=180
@@ -518,7 +579,7 @@ pass "версии исполняемых файлов совпадают, ст�
 version_is_newer 1.10.0 1.9.9 || fail "1.10.0 не распознана как новая версия"
 if version_is_newer 1.2.9 1.3.0; then fail "старая версия распознана как новая"; fi
 cat > "$TEST_ROOT/remote-release" <<'EOF'
-VERSION=1.7.0
+VERSION=1.8.0
 COMMIT=0123456789abcdef0123456789abcdef01234567
 WATCHDOG_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 MANAGER_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -527,7 +588,7 @@ RELEASE_MANIFEST_URL="$TEST_ROOT/remote-release"
 download_file() { cp "$1" "$2"; }
 check_update_status
 assert_equal "$UPDATE_AVAILABLE" yes "доступность обновления"
-assert_equal "$REMOTE_VERSION" 1.7.0 "номер удалённой версии"
+assert_equal "$REMOTE_VERSION" 1.8.0 "номер удалённой версии"
 assert_equal "$REMOTE_COMMIT" 0123456789abcdef0123456789abcdef01234567 "commit выпуска"
 printf 'EXTRA=value\n' >> "$TEST_ROOT/remote-release"
 check_update_status
@@ -638,7 +699,7 @@ $CRON_BEGIN
 */5 * * * * root /opt/bin/wg-watchdog.sh --job Wireguard0
 $CRON_END
 EOF
-printf 'yes\n' > "$UNINSTALL_ROOT/answer"
+printf '2\nyes\n' > "$UNINSTALL_ROOT/answer"
 INPUT_DEVICE="$UNINSTALL_ROOT/answer"
 OUTPUT_DEVICE="$UNINSTALL_ROOT/prompt"
 open_console
@@ -652,6 +713,83 @@ if grep -F 'wg-watchdog.sh' "$CRONTAB_PATH" >/dev/null; then
     fail "строка watchdog осталась в cron после удаления"
 fi
 pass "штатное удаление сохраняет сторонние задания cron"
+
+# Program-only uninstall keeps job configs but disables cron and clears RAM state.
+(
+    keep_root="$TEST_ROOT/uninstall-keep-jobs"
+    CONFIG_DIR="$keep_root/config"
+    STATE_DIR="$keep_root/state"
+    RUN_DIR="$keep_root/run"
+    TMP_DIR="$keep_root/tmp"
+    CRONTAB_PATH="$keep_root/crontab"
+    CRON_INIT=/bin/true
+    WATCHDOG_PATH="$keep_root/bin/wg-watchdog.sh"
+    MANAGER_PATH="$keep_root/bin/wg-watchdog-manager"
+    SHORT_COMMAND="$keep_root/bin/wgwm"
+    LEGACY_CONFIG="$keep_root/legacy.conf"
+    mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR" "$TMP_DIR" "$keep_root/bin"
+    printf "JOB_ID='Wireguard0'\n" > "$CONFIG_DIR/Wireguard0.conf"
+    printf "LAST_RESULT='туннель работает'\n" > "$STATE_DIR/Wireguard0.state"
+    : > "$WATCHDOG_PATH"
+    : > "$MANAGER_PATH"
+    ln -s "$MANAGER_PATH" "$SHORT_COMMAND"
+    cat > "$CRONTAB_PATH" <<EOF
+17 * * * * root /opt/bin/foreign-task
+$CRON_BEGIN
+*/5 * * * * root /opt/bin/wg-watchdog.sh --job Wireguard0
+$CRON_END
+EOF
+    printf '1\nyes\n' > "$keep_root/input"
+    INPUT_DEVICE="$keep_root/input"
+    OUTPUT_DEVICE="$keep_root/output"
+    open_console
+    uninstall_program > "$keep_root/result"
+    exit 99
+) || keep_result=$?
+assert_equal "${keep_result:-0}" 0 "завершение удаления с сохранением заданий"
+[ -f "$TEST_ROOT/uninstall-keep-jobs/config/Wireguard0.conf" ] || fail "сохранённое задание удалено"
+[ ! -e "$TEST_ROOT/uninstall-keep-jobs/state/Wireguard0.state" ] || fail "оперативное состояние сохранено без программы"
+[ ! -e "$TEST_ROOT/uninstall-keep-jobs/bin/wg-watchdog-manager" ] || fail "менеджер остался"
+assert_contains "$TEST_ROOT/uninstall-keep-jobs/crontab" 'foreign-task' "чужой cron при сохранении заданий"
+if grep -F 'wg-watchdog.sh' "$TEST_ROOT/uninstall-keep-jobs/crontab" >/dev/null; then
+    fail "cron watchdog остался после удаления программы"
+fi
+assert_contains "$TEST_ROOT/uninstall-keep-jobs/result" 'Настроенные задания сохранены' "summary сохранения заданий"
+pass "программу можно удалить, сохранив задания для переустановки"
+
+# Выход из меню удаления ничего не меняет.
+(
+    cancel_root="$TEST_ROOT/uninstall-cancel"
+    CONFIG_DIR="$cancel_root/config"
+    STATE_DIR="$cancel_root/state"
+    RUN_DIR="$cancel_root/run"
+    TMP_DIR="$cancel_root/tmp"
+    CRONTAB_PATH="$cancel_root/crontab"
+    CRON_INIT=/bin/true
+    WATCHDOG_PATH="$cancel_root/bin/wg-watchdog.sh"
+    MANAGER_PATH="$cancel_root/bin/wg-watchdog-manager"
+    SHORT_COMMAND="$cancel_root/bin/wgwm"
+    LEGACY_CONFIG="$cancel_root/legacy.conf"
+    mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR" "$TMP_DIR" "$cancel_root/bin"
+    printf "JOB_ID='Wireguard0'\n" > "$CONFIG_DIR/Wireguard0.conf"
+    : > "$WATCHDOG_PATH"
+    : > "$MANAGER_PATH"
+    ln -s "$MANAGER_PATH" "$SHORT_COMMAND"
+    printf '%s\n' "$CRON_BEGIN" \
+        '*/5 * * * * root /opt/bin/wg-watchdog.sh --job Wireguard0' \
+        "$CRON_END" > "$CRONTAB_PATH"
+    cp "$CRONTAB_PATH" "$cancel_root/crontab.expected"
+    printf '0\n' > "$cancel_root/input"
+    INPUT_DEVICE="$cancel_root/input"
+    OUTPUT_DEVICE="$cancel_root/output"
+    open_console
+    uninstall_program >/dev/null
+    [ -f "$WATCHDOG_PATH" ] || fail "отмена удаления удалила watchdog"
+    [ -f "$MANAGER_PATH" ] || fail "отмена удаления удалила менеджер"
+    [ -f "$CONFIG_DIR/Wireguard0.conf" ] || fail "отмена удаления удалила задание"
+    cmp -s "$CRONTAB_PATH" "$cancel_root/crontab.expected" || fail "отмена удаления изменила cron"
+)
+pass "из меню удаления можно вернуться без изменений"
 
 # Жизненный цикл установщика: первая установка, повторный запуск и --force.
 INSTALL_ROOT="$TEST_ROOT/installer"
@@ -684,7 +822,7 @@ chmod 755 "$INSTALL_MOCK_BIN/id" "$INSTALL_MOCK_BIN/wget"
 watchdog_release_hash=$(sha256sum "$WATCHDOG" | awk '{ print $1 }')
 manager_release_hash=$(sha256sum "$MANAGER" | awk '{ print $1 }')
 cat > "$INSTALL_ROOT/RELEASE" <<EOF
-VERSION=1.6.0
+VERSION=1.7.0
 COMMIT=0123456789abcdef0123456789abcdef01234567
 WATCHDOG_SHA256=$watchdog_release_hash
 MANAGER_SHA256=$manager_release_hash
@@ -709,7 +847,7 @@ installer_env() {
 }
 installer_env > "$INSTALL_ROOT/first-output"
 assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.6.0 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.7.0 установлен.' "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -732,9 +870,9 @@ pass "повторная установочная команда только з
 
 : > "$INSTALL_ROOT/prompt"
 installer_env --force > "$INSTALL_ROOT/force-output"
-assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.6.0"' "принудительная переустановка менеджера"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.7.0"' "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.6.0 установлен.' "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.7.0 установлен.' "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.
@@ -827,7 +965,7 @@ pass "отмена удаления не выводит ложное сообщ�
     JOB_ID=Wireguard3
     WG_INTERFACE=Wireguard3
     write_config
-    printf '\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+    printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
     open_console
     configure_job edit Wireguard3 > "$DIALOG_ROOT/edit-output"
     if grep -F 'Выберите пир' "$OUTPUT_DEVICE" >/dev/null; then fail "повторный выбор пира при редактировании"; fi
@@ -918,7 +1056,7 @@ pass "отложенный cron тихо завершается после уд�
     cp "$WATCHDOG" "$direct_root/opt/bin/wg-watchdog.sh"
     cp "$MANAGER" "$direct_root/opt/bin/wg-watchdog-manager"
     printf '%s\n' '17 * * * * root /opt/bin/foreign-task' > "$direct_root/opt/etc/crontab"
-    printf 'yes\n' > "$direct_root/input"
+    printf '2\nyes\n' > "$direct_root/input"
     : > "$direct_root/output"
     WG_WATCHDOG_LIB_ONLY=no \
     WG_WATCHDOG_OPT_ROOT="$direct_root/opt" \
@@ -928,7 +1066,7 @@ pass "отложенный cron тихо завершается после уд�
     WG_WATCHDOG_OUTPUT="$direct_root/output" \
         sh "$MANAGER" --uninstall > "$direct_root/result"
     [ ! -e "$direct_root/opt/bin/wg-watchdog-manager" ] || fail "прямое удаление не удалило менеджер"
-    assert_contains "$direct_root/result" 'WG Watchdog удалён' "результат прямого удаления"
+    assert_contains "$direct_root/result" 'WG Watchdog и все его задания удалены' "результат прямого удаления"
     assert_contains "$direct_root/opt/etc/crontab" 'foreign-task' "чужой cron"
 )
 pass "прямое удаление работает без opkg и установки зависимостей"
@@ -945,7 +1083,7 @@ pass "прямое удаление работает без opkg и устано
     printf 'foreign cron\n' > "$CRONTAB_PATH"
     mkdir -p "$RUN_DIR/wg-watchdog-Wireguard0.lock"
     printf '%s\n' "$$" > "$RUN_DIR/wg-watchdog-Wireguard0.lock/pid"
-    printf 'yes\n' > "$INPUT_DEVICE"
+    printf '2\nyes\n' > "$INPUT_DEVICE"
     open_console
     WAIT_SECONDS=0
     uninstall_program > "$DIALOG_ROOT/result"
@@ -981,7 +1119,7 @@ pass "обслуживание продолжает работу после за
     SHORT_COMMAND="$DIALOG_ROOT/wgwm"
     : > "$WATCHDOG_PATH"
     : > "$MANAGER_PATH"
-    printf 'yes\n' > "$INPUT_DEVICE"
+    printf '2\nyes\n' > "$INPUT_DEVICE"
     open_console
     rm() {
         for remove_arg in "$@"; do

@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -80,7 +80,12 @@ ui_stop() {
 
 ui_pause() {
     [ "$UI_ACTIVE" = yes ] || return 0
-    printf '\033[%s;1H\033[2KEnter — продолжить: ' "$UI_ROWS" >&4
+    # Keep the confirmation next to the result instead of detaching it at
+    # the bottom edge of a large terminal.
+    [ "$UI_ROW" -lt "$UI_ROWS" ] || UI_ROW=$((UI_ROWS - 1))
+    printf '\033[%s;1H\033[2K' "$UI_ROW" >&4
+    UI_ROW=$((UI_ROW + 1))
+    printf '\033[%s;1H\033[2KНажмите Enter, чтобы продолжить: ' "$UI_ROW" >&4
     IFS= read -r ui_answer <&3 || exit 0
     ui_clear
 }
@@ -900,6 +905,7 @@ load_config() {
     PING_TIMEOUT=""
     RESTART_DELAY=""
     CHECK_INTERVAL=""
+    INTERNET_CHECK=""
     WG_SERVER_PUBLIC_IP=""
     FAILURE_THRESHOLD=""
     RESTART_COOLDOWN=""
@@ -924,6 +930,7 @@ PING_COUNT='$PING_COUNT'
 PING_TIMEOUT='$PING_TIMEOUT'
 RESTART_DELAY='$RESTART_DELAY'
 CHECK_INTERVAL='$CHECK_INTERVAL'
+INTERNET_CHECK='$INTERNET_CHECK'
 FAILURE_THRESHOLD='$FAILURE_THRESHOLD'
 RESTART_COOLDOWN='$RESTART_COOLDOWN'
 BOOT_GRACE='$BOOT_GRACE'
@@ -1034,6 +1041,7 @@ migrate_legacy_config() {
     if valid_interface "$WG_INTERFACE" && valid_address "$WG_SERVER_TUNNEL_IP"; then
         JOB_ID=$WG_INTERFACE
         CHECK_INTERVAL=5
+        INTERNET_CHECK=yes
         WG_SERVER_PUBLIC_IP=""
         FAILURE_THRESHOLD=2
         RESTART_COOLDOWN=30
@@ -1067,6 +1075,8 @@ upgrade_config_files() {
         BOOT_GRACE=${BOOT_GRACE:-180}
         RECOVERY_CHECK_DELAY=${RECOVERY_CHECK_DELAY:-15}
         WG_SERVER_PUBLIC_IP=${WG_SERVER_PUBLIC_IP:-}
+        # Jobs created before v1.7.0 keep their former external-network gate.
+        case "${INTERNET_CHECK:-}" in yes|no) ;; *) INTERNET_CHECK=yes ;; esac
         is_positive_integer "$FAILURE_THRESHOLD" && [ "$FAILURE_THRESHOLD" -le 10 ] || FAILURE_THRESHOLD=2
         is_positive_integer "$RESTART_COOLDOWN" && [ "$RESTART_COOLDOWN" -le 1440 ] || RESTART_COOLDOWN=30
         is_positive_integer "$BOOT_GRACE" && [ "$BOOT_GRACE" -le 3600 ] || BOOT_GRACE=180
@@ -1088,6 +1098,7 @@ configure_job() {
         default_ping_timeout=$PING_TIMEOUT
         default_restart_delay=$RESTART_DELAY
         default_interval=$CHECK_INTERVAL
+        default_internet_check=${INTERNET_CHECK:-yes}
         default_public_ip=${WG_SERVER_PUBLIC_IP:-}
         default_failure_threshold=${FAILURE_THRESHOLD:-2}
         default_restart_cooldown=${RESTART_COOLDOWN:-30}
@@ -1101,6 +1112,7 @@ configure_job() {
         default_ping_timeout=3
         default_restart_delay=3
         default_interval=5
+        default_internet_check=no
         default_public_ip=""
         default_failure_threshold=2
         default_restart_cooldown=30
@@ -1202,6 +1214,26 @@ configure_job() {
         fi
     fi
 
+    if [ "$mode" = "edit" ]; then
+        say ""
+        say "Проверка обычного интернета по 1.1.1.1 и 8.8.8.8 может запретить"
+        say "восстановление, если эти адреса маршрутизируются через сам WireGuard."
+        say "Для full-tunnel её следует оставить выключенной."
+        if [ "$default_internet_check" = yes ]; then
+            if confirm_yes "Продолжать проверять обычный интернет?"; then
+                INTERNET_CHECK=yes
+            else
+                INTERNET_CHECK=no
+            fi
+        elif confirm "Включить проверку обычного интернета?"; then
+            INTERNET_CHECK=yes
+        else
+            INTERNET_CHECK=no
+        fi
+    else
+        INTERNET_CHECK=$default_internet_check
+    fi
+
     if [ "$mode" = "add" ]; then
         PING_COUNT=$default_ping_count
         PING_TIMEOUT=$default_ping_timeout
@@ -1240,6 +1272,7 @@ configure_job() {
         say "  перезапуск после $FAILURE_THRESHOLD неудачных проверок; пауза down/up $RESTART_DELAY сек.;"
         say "  контроль после перезапуска через $RECOVERY_CHECK_DELAY сек.; cooldown $RESTART_COOLDOWN мин.;"
         say "  ожидание после загрузки роутера $BOOT_GRACE сек."
+        say "  проверка обычного интернета выключена (безопасно для full-tunnel)."
         say "Изменить эти значения можно через пункт «Изменить задание»."
     fi
 }
@@ -1349,6 +1382,11 @@ show_job_status() {
     say "  Внутренний адрес сервера: $WG_SERVER_TUNNEL_IP"
     say "  Публичный адрес сервера:  ${WG_SERVER_PUBLIC_IP:-не используется}"
     say "  Частота проверки:         $CHECK_INTERVAL мин."
+    if [ "$INTERNET_CHECK" = yes ]; then
+        say "  Проверка интернета:       включена"
+    else
+        say "  Проверка интернета:       выключена"
+    fi
     say "  Последний результат:      $LAST_RESULT"
     say "  Последняя проверка:       $LAST_CHECK_TEXT"
     say "  Последний успех:          $LAST_SUCCESS_TEXT"
@@ -1390,21 +1428,50 @@ remove_managed_cron() {
 uninstall_program() {
     check_managed_directories
     say ""
-    say "Будут удалены программа, все задания WG Watchdog, их состояние и строки cron."
+    say "Что удалить:"
+    say "  1) Удалить программу, но сохранить настроенные задания"
+    say "  2) Удалить программу вместе со всеми заданиями"
+    say "  0) Вернуться в главное меню"
+    while :; do
+        read_answer "Выберите вариант удаления" "0"
+        case "$REPLY" in
+            1) uninstall_mode=keep ; break ;;
+            2) uninstall_mode=all ; break ;;
+            0) return 0 ;;
+            *) say "Введите 1, 2 или 0." ;;
+        esac
+    done
+    say ""
     say "Пакеты Entware cron и ndmq останутся: они могут использоваться другими программами."
-    confirm "Полностью удалить WG Watchdog?" || return 0
+    if [ "$uninstall_mode" = keep ]; then
+        say "Конфигурации останутся в $CONFIG_DIR и будут подхвачены после переустановки."
+        confirm "Удалить программу и сохранить задания?" || return 0
+    else
+        say "Настройки заданий и их состояние будут удалены без возможности восстановления."
+        confirm "Удалить программу и все задания?" || return 0
+    fi
     begin_maintenance || return 0
     remove_managed_cron
     : > "$RUN_DIR/uninstalled" || die "не удалось заблокировать отложенные запуски"
-    for file in "$CONFIG_DIR"/*.conf; do
-        [ -f "$file" ] || continue
-        remove_id=${file##*/}
-        remove_id=${remove_id%.conf}
-        valid_interface "$remove_id" || continue
-        remove_job_files "$remove_id" || die "удаление не завершено: часть файлов осталась"
-    done
-    rm -f "$LEGACY_CONFIG" || die "не удалось удалить прежнюю конфигурацию"
-    rmdir "$CONFIG_DIR" 2>/dev/null || true
+    if [ "$uninstall_mode" = all ]; then
+        for file in "$CONFIG_DIR"/*.conf; do
+            [ -f "$file" ] || continue
+            remove_id=${file##*/}
+            remove_id=${remove_id%.conf}
+            valid_interface "$remove_id" || continue
+            remove_job_files "$remove_id" || die "удаление не завершено: часть файлов осталась"
+        done
+        rm -f "$LEGACY_CONFIG" || die "не удалось удалить прежнюю конфигурацию"
+        rmdir "$CONFIG_DIR" 2>/dev/null || true
+    else
+        for state_file in "$STATE_DIR"/*.state; do
+            [ -f "$state_file" ] || continue
+            state_id=${state_file##*/}
+            state_id=${state_id%.state}
+            valid_interface "$state_id" || continue
+            rm -f "$state_file" || die "не удалось очистить состояние $state_id"
+        done
+    fi
     rmdir "$STATE_DIR" 2>/dev/null || true
     if [ "$RUN_DIR" != "$STATE_DIR" ]; then
         rmdir "$RUN_DIR" 2>/dev/null || true
@@ -1415,7 +1482,13 @@ uninstall_program() {
         rm -f "$SHORT_COMMAND" || die "программа удалена, но не удалось удалить ссылку wgwm"
     fi
     ui_stop
-    say "WG Watchdog удалён. Сторонние задания cron сохранены."
+    if [ "$uninstall_mode" = keep ]; then
+        say "WG Watchdog удалён. Настроенные задания сохранены в $CONFIG_DIR."
+        say "После переустановки они снова появятся в менеджере и cron."
+    else
+        say "WG Watchdog и все его задания удалены."
+    fi
+    say "Сторонние задания cron сохранены."
     exit 0
 }
 

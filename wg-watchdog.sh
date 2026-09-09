@@ -2,7 +2,7 @@
 
 # WG Watchdog for KeeneticOS + Entware
 
-VERSION="1.6.0"
+VERSION="1.7.0"
 CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-/opt/etc/wg-watchdog.d}"
 STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
@@ -124,6 +124,7 @@ reset_state() {
     LAST_CHECK_TEXT="никогда"
     LAST_SUCCESS_TEXT="никогда"
     LAST_RESTART_EPOCH=0
+    LAST_RESTART_UPTIME=0
     LAST_RESTART_TEXT="никогда"
     LAST_RESULT="ещё не проверялось"
 }
@@ -137,6 +138,7 @@ load_state() {
     is_nonnegative_integer "${CONSECUTIVE_FAILURES:-}" || CONSECUTIVE_FAILURES=0
     is_nonnegative_integer "${LAST_CHECK_EPOCH:-}" || LAST_CHECK_EPOCH=0
     is_nonnegative_integer "${LAST_RESTART_EPOCH:-}" || LAST_RESTART_EPOCH=0
+    is_nonnegative_integer "${LAST_RESTART_UPTIME:-}" || LAST_RESTART_UPTIME=0
     if [ "${STATE_BOOT_ID:-}" != "$CURRENT_BOOT_ID" ]; then
         reset_state
     fi
@@ -153,6 +155,7 @@ save_state() {
         printf "LAST_CHECK_TEXT='%s'\n" "$LAST_CHECK_TEXT"
         printf "LAST_SUCCESS_TEXT='%s'\n" "$LAST_SUCCESS_TEXT"
         printf "LAST_RESTART_EPOCH='%s'\n" "$LAST_RESTART_EPOCH"
+        printf "LAST_RESTART_UPTIME='%s'\n" "$LAST_RESTART_UPTIME"
         printf "LAST_RESTART_TEXT='%s'\n" "$LAST_RESTART_TEXT"
         printf "LAST_RESULT='%s'\n" "$LAST_RESULT"
     } > "$STATE_TMP" || return 1
@@ -174,6 +177,9 @@ record_transition() {
     record_result "$new_result"
     if [ "$previous_result" != "$new_result" ]; then
         log_message "$transition_message"
+    else
+        # Manual checks always explain their result without duplicating syslog.
+        say "$transition_message"
     fi
 }
 
@@ -219,6 +225,7 @@ fi
 : "${BOOT_GRACE:=180}"
 : "${RECOVERY_CHECK_DELAY:=15}"
 : "${WG_SERVER_PUBLIC_IP:=}"
+: "${INTERNET_CHECK:=yes}"
 
 if [ "${ENABLED:-no}" != "yes" ] && [ "$FORCE" != "yes" ]; then
     exit 0
@@ -242,6 +249,10 @@ is_integer_between "$RECOVERY_CHECK_DELAY" 1 300 || {
     log_message "[$JOB_ID] в настройках найдено недопустимое числовое значение"
     exit 1
 }
+case "$INTERNET_CHECK" in
+    yes|no) ;;
+    *) log_message "[$JOB_ID] в настройках найден недопустимый режим проверки интернета"; exit 1 ;;
+esac
 
 acquire_lock
 lock_result=$?
@@ -264,18 +275,25 @@ CURRENT_BOOT_ID=$(sed -n '1p' "$BOOT_ID_FILE" 2>/dev/null)
 [ -n "$CURRENT_BOOT_ID" ] || CURRENT_BOOT_ID="unknown"
 NOW_EPOCH=$(date +%s 2>/dev/null)
 is_nonnegative_integer "$NOW_EPOCH" || NOW_EPOCH=0
+CURRENT_UPTIME=$(sed -n '1s/\..*//p' "$UPTIME_FILE" 2>/dev/null)
+if is_nonnegative_integer "$CURRENT_UPTIME"; then
+    UPTIME_AVAILABLE=yes
+else
+    CURRENT_UPTIME=0
+    UPTIME_AVAILABLE=no
+fi
 load_state
 
-uptime_seconds=$(sed -n '1s/\..*//p' "$UPTIME_FILE" 2>/dev/null)
-if is_nonnegative_integer "$uptime_seconds" && [ "$uptime_seconds" -lt "$BOOT_GRACE" ]; then
+if [ "$UPTIME_AVAILABLE" = yes ] && [ "$CURRENT_UPTIME" -lt "$BOOT_GRACE" ]; then
     CONSECUTIVE_FAILURES=0
     record_transition "пауза после загрузки роутера" \
-        "[$JOB_ID] после загрузки прошло ${uptime_seconds}с — проверка отложена"
+        "[$JOB_ID] после загрузки прошло ${CURRENT_UPTIME}с — проверка отложена"
     exit 0
 fi
 
 # Если обычный интернет недоступен, перезапуск туннеля не поможет.
-if ! ping_target 1 1.1.1.1 && ! ping_target 1 8.8.8.8; then
+if [ "$INTERNET_CHECK" = yes ] && \
+   ! ping_target 1 1.1.1.1 && ! ping_target 1 8.8.8.8; then
     CONSECUTIVE_FAILURES=0
     record_transition "обычный интернет недоступен" \
         "[$JOB_ID] интернет недоступен — перезапуск $WG_INTERFACE пропущен"
@@ -306,9 +324,16 @@ if [ "$CONSECUTIVE_FAILURES" -lt "$FAILURE_THRESHOLD" ]; then
 fi
 
 cooldown_seconds=$((RESTART_COOLDOWN * 60))
-if [ "$NOW_EPOCH" -gt 0 ] && [ "$LAST_RESTART_EPOCH" -gt 0 ]; then
+since_restart=-1
+if [ "$CURRENT_UPTIME" -gt 0 ] && [ "$LAST_RESTART_UPTIME" -gt 0 ]; then
+    since_restart=$((CURRENT_UPTIME - LAST_RESTART_UPTIME))
+elif [ "$NOW_EPOCH" -gt 0 ] && [ "$LAST_RESTART_EPOCH" -gt 0 ]; then
     since_restart=$((NOW_EPOCH - LAST_RESTART_EPOCH))
-    if [ "$since_restart" -ge 0 ] && [ "$since_restart" -lt "$cooldown_seconds" ]; then
+    # A backward wall-clock correction must not bypass cooldown.
+    [ "$since_restart" -ge 0 ] || since_restart=0
+fi
+if [ "$since_restart" -ge 0 ]; then
+    if [ "$since_restart" -lt "$cooldown_seconds" ]; then
         remaining=$(((cooldown_seconds - since_restart + 59) / 60))
         CONSECUTIVE_FAILURES=$FAILURE_THRESHOLD
         record_transition "cooldown после перезапуска" \
@@ -318,6 +343,7 @@ if [ "$NOW_EPOCH" -gt 0 ] && [ "$LAST_RESTART_EPOCH" -gt 0 ]; then
 fi
 
 LAST_RESTART_EPOCH=$NOW_EPOCH
+LAST_RESTART_UPTIME=$CURRENT_UPTIME
 LAST_RESTART_TEXT=$(current_text_time)
 CONSECUTIVE_FAILURES=$FAILURE_THRESHOLD
 record_result "перезапуск интерфейса"

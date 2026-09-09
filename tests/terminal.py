@@ -73,7 +73,7 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                         output.count("Выберите задание".encode())
                         + output.count("Какое задание".encode())
                     )
-                    pages_seen = output.count("Enter — продолжить".encode())
+                    pages_seen = output.count("Нажмите Enter, чтобы продолжить".encode())
                     if job_prompts_seen > job_prompts_answered:
                         job_prompts_answered = job_prompts_seen
                         os.write(master, (pending_job_answers.pop(0) + "\n").encode())
