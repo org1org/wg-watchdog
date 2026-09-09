@@ -644,7 +644,7 @@ installer_env() {
 }
 installer_env > "$INSTALL_ROOT/first-output"
 assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.5.1 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.5.2 установлен.' "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -667,9 +667,9 @@ pass "повторная установочная команда только з
 
 : > "$INSTALL_ROOT/prompt"
 installer_env --force > "$INSTALL_ROOT/force-output"
-assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.5.1"' "принудительная переустановка менеджера"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.5.2"' "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.5.1 установлен.' "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.5.2 установлен.' "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.
@@ -945,8 +945,10 @@ pass "каталоги-ссылки отклоняются до удаления
 # Some Entware mounts expose one mapped UID for the whole /opt filesystem.
 (
     mapped_root="$TEST_ROOT/mapped-owner"
-    mkdir -p "$mapped_root/opt/etc/wg-watchdog.d"
+    mkdir -p "$mapped_root/opt/bin" "$mapped_root/opt/etc/wg-watchdog.d"
     OPT_ROOT="$mapped_root/opt"
+    MANAGER_PATH="$mapped_root/opt/bin/wg-watchdog-manager"
+    : > "$MANAGER_PATH"
     CONFIG_DIR="$mapped_root/opt/etc/wg-watchdog.d"
     STATE_DIR="$mapped_root/missing-state"
     RUN_DIR="$mapped_root/missing-run"
@@ -954,6 +956,8 @@ pass "каталоги-ссылки отклоняются до удаления
     printf '1234\n' > "$owner_file"
     stat() {
         if [ "$1" = -c ] && [ "$2" = %u ] && [ "$3" = "$OPT_ROOT/." ]; then
+            return 1
+        elif [ "$1" = -c ] && [ "$2" = %u ] && [ "$3" = "$MANAGER_PATH" ]; then
             printf '1234\n'
         elif [ "$1" = -c ] && [ "$2" = %u ] && [ "$3" = "$CONFIG_DIR" ]; then
             cat "$owner_file"
@@ -967,6 +971,6 @@ pass "каталоги-ссылки отклоняются до удаления
         fail "принят посторонний владелец каталога конфигурации"
     fi
 )
-pass "владелец конфигурации может совпадать с владельцем файловой системы Entware"
+pass "владелец конфигурации сверяется с менеджером без stat самого /opt"
 
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"
