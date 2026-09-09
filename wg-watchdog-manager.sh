@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
@@ -201,11 +201,18 @@ acquire_manager_lock() (
 )
 
 check_managed_directories() {
+    opt_owner=$(stat -c %u "$OPT_ROOT/." 2>/dev/null) || \
+        die "не удалось проверить владельца $OPT_ROOT"
     for managed_dir in "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR"; do
         [ ! -L "$managed_dir" ] || die "каталог-ссылка не поддерживается: $managed_dir"
         [ -e "$managed_dir" ] || continue
         [ -d "$managed_dir" ] || die "ожидался каталог: $managed_dir"
-        [ "$(stat -c %u "$managed_dir" 2>/dev/null)" = 0 ] || die "каталог должен принадлежать root: $managed_dir"
+        managed_owner=$(stat -c %u "$managed_dir" 2>/dev/null) || \
+            die "не удалось проверить владельца $managed_dir"
+        if [ "$managed_owner" != 0 ]; then
+            [ "$managed_dir" = "$CONFIG_DIR" ] && [ "$managed_owner" = "$opt_owner" ] || \
+                die "владелец каталога отличается от владельца Entware: $managed_dir"
+        fi
         managed_mode=$(stat -c %a "$managed_dir" 2>/dev/null) || die "не удалось проверить права $managed_dir"
         case "$managed_mode" in
             *[2367][0-7]|*[0-7][2367]) die "каталог доступен для записи другим пользователям: $managed_dir" ;;

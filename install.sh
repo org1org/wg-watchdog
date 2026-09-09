@@ -2,7 +2,7 @@
 
 # Compact bootstrap installer for WG Watchdog.
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 BASE_URL="${WG_WATCHDOG_BASE_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog/main}"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
 MANAGER_URL="$BASE_URL/wg-watchdog-manager.sh"
