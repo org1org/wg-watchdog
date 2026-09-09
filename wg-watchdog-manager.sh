@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"

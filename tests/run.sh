@@ -492,12 +492,12 @@ pass "версии распространяемых файлов совпада�
 # Семантическое сравнение и загрузка небольшого файла VERSION.
 version_is_newer 1.10.0 1.9.9 || fail "1.10.0 не распознана как новая версия"
 if version_is_newer 1.2.9 1.3.0; then fail "старая версия распознана как новая"; fi
-printf '1.5.0\n' > "$TEST_ROOT/remote-version"
+printf '1.6.0\n' > "$TEST_ROOT/remote-version"
 VERSION_URL="$TEST_ROOT/remote-version"
 download_file() { cp "$1" "$2"; }
 check_update_status
 assert_equal "$UPDATE_AVAILABLE" yes "доступность обновления"
-assert_equal "$REMOTE_VERSION" 1.5.0 "номер удалённой версии"
+assert_equal "$REMOTE_VERSION" 1.6.0 "номер удалённой версии"
 pass "проверка обновлений использует корректное сравнение версий"
 
 # Короткая команда создаётся только в свободном месте и не затирает коллизию.
@@ -644,7 +644,7 @@ installer_env() {
 }
 installer_env > "$INSTALL_ROOT/first-output"
 assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.4.0 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.5.0 установлен.' "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -667,9 +667,9 @@ pass "повторная установочная команда только з
 
 : > "$INSTALL_ROOT/prompt"
 installer_env --force > "$INSTALL_ROOT/force-output"
-assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.4.0"' "принудительная переустановка менеджера"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.5.0"' "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.4.0 установлен.' "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.5.0 установлен.' "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.
