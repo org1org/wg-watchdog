@@ -1,0 +1,47 @@
+name: Release v1.5.2
+
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/release-v1.5.2.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Проверить версию и тесты
+        run: |
+          test "$(cat VERSION)" = "1.5.2"
+          test "$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' install.sh | head -n 1)" = "1.5.2"
+          test "$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' wg-watchdog-manager.sh | head -n 1)" = "1.5.2"
+          test "$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' wg-watchdog.sh | head -n 1)" = "1.5.2"
+          sudo dash tests/run.sh
+          python3 tests/terminal.py
+      - name: Создать тег и релиз
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_SHA: 14801245bf8b4234c24a902160e2f9475a848624
+        run: |
+          cat > /tmp/release-notes.md <<'EOF'
+          ## Изменения
+
+          - Исправлена ошибка «не удалось проверить владельца /opt» на Keenetic.
+          - Для проверки владельца файловой системы Entware используется установленный файл менеджера.
+          - Проверка больше не вызывает `stat` для специального пути `/opt`.
+          - Сохранены проверки владельца каталога конфигурации, ссылок и небезопасных прав.
+          - Автоматический стенд включает 56 функциональных и 6 терминальных проверок.
+          EOF
+          gh release create v1.5.2 --repo "$GITHUB_REPOSITORY" --target "$TARGET_SHA" --title "WG Watchdog v1.5.2" --notes-file /tmp/release-notes.md
+      - name: Удалить одноразовый workflow
+        run: |
+          rm -f .github/workflows/release-v1.5.2.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/workflows/release-v1.5.2.yml
+          git commit -m "Remove one-time v1.5.2 release workflow"
+          git push origin HEAD:main
