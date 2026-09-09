@@ -15,7 +15,8 @@ import time
 REPO = Path(__file__).resolve().parent.parent
 
 
-def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0, actions=None):
+def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
+             actions=None, job_answers=None, disabled_jobs=None):
     with tempfile.TemporaryDirectory(prefix="wgwm-pty-") as root:
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -24,9 +25,10 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0, actions=Non
         env.pop("NO_COLOR", None)
         Path(root, "config").mkdir()
         for number in range(jobs):
+            enabled = "no" if number in (disabled_jobs or []) else "yes"
             Path(root, "config", f"Wireguard{number}.conf").write_text(
                 f"JOB_ID='Wireguard{number}'\nWG_INTERFACE='Wireguard{number}'\n"
-                "ENABLED='yes'\nWG_SERVER_TUNNEL_IP='10.0.0.1'\nCHECK_INTERVAL='5'\n"
+                f"ENABLED='{enabled}'\nWG_SERVER_TUNNEL_IP='10.0.0.1'\nCHECK_INTERVAL='5'\n"
             )
         script = """
             . "$TEST_REPO/wg-watchdog-manager.sh"
@@ -50,8 +52,10 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0, actions=Non
         output = bytearray()
         sent = False
         prompts_answered = 0
+        job_prompts_answered = 0
         pages_answered = 0
         pending_actions = list(actions or ["0"])
+        pending_job_answers = list(job_answers or [])
         deadline = time.monotonic() + 10
         try:
             while time.monotonic() < deadline:
@@ -65,8 +69,15 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0, actions=Non
                         break
                     output.extend(chunk)
                     prompts_seen = output.count("Выберите действие".encode())
+                    job_prompts_seen = (
+                        output.count("Выберите задание".encode())
+                        + output.count("Какое задание".encode())
+                    )
                     pages_seen = output.count("Enter — продолжить".encode())
-                    if prompts_seen > prompts_answered:
+                    if job_prompts_seen > job_prompts_answered:
+                        job_prompts_answered = job_prompts_seen
+                        os.write(master, (pending_job_answers.pop(0) + "\n").encode())
+                    elif prompts_seen > prompts_answered:
                         prompts_answered = prompts_seen
                         if terminate:
                             process.send_signal(signal.SIGTERM)
@@ -90,10 +101,14 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0, actions=Non
                 assert b"\x1b[?7h" in output
                 assert b"\x1b[2J" in output
                 assert b"\x1b[1;36m" in output
-            if jobs > 3:
-                assert "Следующие задания".encode() in output
-                if rows >= 24 and cols >= 80:
-                    assert "Enter — продолжить".encode() not in output, "Главное меню не помещается на экране"
+            assert "Wireguard3".encode() in output, "Показаны не все интерфейсы"
+            assert "Два пира".encode() in output, "Не показано описание последнего интерфейса"
+            if job_answers:
+                assert "Настроенные задания:".encode() in output
+                assert "0) Вернуться в главное меню".encode() in output
+                assert "Выберите задание [1]".encode() not in output
+            if disabled_jobs:
+                assert b"\x1b[1;31m" in output, "Отключённое задание не выделено красным"
             return output.decode(errors="replace")
         finally:
             if process.poll() is None:
@@ -108,8 +123,8 @@ if __name__ == "__main__":
         dict(rows=20, cols=60),
         dict(terminate=True),
         dict(plain=True),
-        dict(jobs=7, actions=["n", "0"]),
-        dict(actions=["i", "0"]),
+        dict(jobs=7, disabled_jobs=[2]),
+        dict(jobs=2, actions=["3", "0"], job_answers=["0"]),
     ]:
         run_case(**case)
         print("ok PTY", case)

@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.5.3"
+VERSION="1.5.4"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
@@ -41,7 +41,6 @@ MANAGER_LOCK_HELD=no
 MAINTENANCE_HELD=no
 WAIT_SECONDS=20
 SLEEP_BIN=sleep
-JOB_PAGE=0
 
 ui_size() {
     terminal_size=$(stty size <&3 2>/dev/null || true)
@@ -113,11 +112,15 @@ ui_prompt() {
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
     COLOR_GREEN=$(printf '\033[1;32m')
+    COLOR_RED=$(printf '\033[1;31m')
+    COLOR_GRAY=$(printf '\033[1;90m')
     COLOR_YELLOW=$(printf '\033[1;33m')
     COLOR_CYAN=$(printf '\033[1;36m')
     COLOR_RESET=$(printf '\033[0m')
 else
     COLOR_GREEN=""
+    COLOR_RED=""
+    COLOR_GRAY=""
     COLOR_YELLOW=""
     COLOR_CYAN=""
     COLOR_RESET=""
@@ -1043,6 +1046,7 @@ configure_job() {
 }
 
 build_job_index() {
+    display_mode=${1:-page}
     detect_interfaces
     make_temp jobs
     JOB_INDEX=$REPLY
@@ -1055,14 +1059,20 @@ build_job_index() {
         printf '%s\n' "$JOB_ID" >> "$JOB_INDEX"
         interface_description "$WG_INTERFACE"
         description=$REPLY
-        if [ "$ENABLED" = "yes" ]; then state="включено"; else state="выключено"; fi
-        if [ "$UI_ACTIVE" = yes ]; then
-            if [ "$count" -gt "$((JOB_PAGE * 3))" ] && [ "$count" -le "$((JOB_PAGE * 3 + 3))" ]; then
-                say "$COLOR_GREEN$count. $WG_INTERFACE — $state$COLOR_RESET"
-            fi
+        if [ "$ENABLED" = "yes" ]; then
+            state="включено"
+            state_color=$COLOR_GREEN
+        else
+            state="выключено"
+            state_color=$COLOR_RED
+        fi
+        if [ "$display_mode" = quiet ]; then
+            :
+        elif [ "$UI_ACTIVE" = yes ]; then
+            say "$state_color$count. $WG_INTERFACE — $state$COLOR_RESET"
         else
             printf '  %s%s. %s — %s; сервер %s; каждые %s мин.; %s%s\n' \
-                "$COLOR_GREEN" "$count" "$WG_INTERFACE" "$description" \
+                "$state_color" "$count" "$WG_INTERFACE" "$description" \
                 "$WG_SERVER_TUNNEL_IP" "$CHECK_INTERVAL" "$state" "$COLOR_RESET"
         fi
     done
@@ -1070,14 +1080,23 @@ build_job_index() {
 }
 
 select_job() {
-    [ "$JOB_COUNT" -gt 0 ] || return 1
+    say "Настроенные задания:"
+    build_job_index all
+    [ "$JOB_COUNT" -gt 0 ] || { say "  Нет настроенных заданий."; return 1; }
+    say ""
+    say "  0) Вернуться в главное меню"
     while :; do
-        read_answer "$1" "1"
+        read_answer "$1" ""
+        if [ "$REPLY" = 0 ]; then
+            ACTION_PAUSE=no
+            SELECTED_JOB=""
+            return 1
+        fi
         if is_positive_integer "$REPLY" && [ "$REPLY" -le "$JOB_COUNT" ]; then
             SELECTED_JOB=$(sed -n "${REPLY}p" "$JOB_INDEX")
             return 0
         fi
-        say "Введите номер от 1 до $JOB_COUNT."
+        say "Введите номер от 1 до $JOB_COUNT или 0 для возврата."
     done
 }
 
@@ -1217,22 +1236,28 @@ show_header() {
 
 show_detected_interfaces() {
     detect_interfaces
-    if [ "$UI_ACTIVE" = yes ] && [ "${1:-}" != all ]; then
-        say "Интерфейсы (первые два):"
-    else
-        say "Найденные WireGuard-интерфейсы:"
-    fi
+    say "WireGuard-интерфейсы:"
     if [ -z "$INTERFACE_LIST" ]; then
         say "  Не найдены. При добавлении задания имя можно будет ввести вручную."
         return 0
     fi
-    interface_shown=0
     while IFS="$(printf '\t')" read -r iface description; do
-        interface_shown=$((interface_shown + 1))
-        if [ "$UI_ACTIVE" = yes ] && [ "${1:-}" != all ] && [ "$interface_shown" -gt 2 ]; then
-            break
+        interface_color=$COLOR_GRAY
+        interface_line="  $iface — $description"
+        interface_config="$CONFIG_DIR/$iface.conf"
+        if [ -f "$interface_config" ]; then
+            load_config "$interface_config"
+            if [ "$JOB_ID" = "$iface" ] && [ "$WG_INTERFACE" = "$iface" ]; then
+                if [ "$ENABLED" = yes ]; then
+                    interface_color=$COLOR_GREEN
+                    interface_line="  $iface — включена · $description"
+                else
+                    interface_color=$COLOR_RED
+                    interface_line="  $iface — выключена · $description"
+                fi
+            fi
         fi
-        say "  • $iface — $description"
+        say "${interface_color}$interface_line${COLOR_RESET}"
     done <<EOF
 $INTERFACE_LIST
 EOF
@@ -1255,18 +1280,12 @@ main_menu() {
             if [ "$UPDATE_AVAILABLE" = yes ]; then
                 say "${COLOR_YELLOW}Доступно обновление: $REMOTE_VERSION${COLOR_RESET}"
             fi
-            show_detected_interfaces
+            say ""
         fi
-        [ "$UI_ACTIVE" = yes ] || say ""
-        say "Настроенные задания:"
-        build_job_index
-        if [ "$UI_ACTIVE" = yes ] && [ "$JOB_COUNT" -gt 3 ]; then
-            say "n) Следующие задания · i) Интерфейсы"
-        elif [ "$UI_ACTIVE" = yes ]; then
-            say "i) Все интерфейсы"
-        fi
-        [ "$JOB_COUNT" -gt 0 ] || say "  Нет настроенных заданий."
-        [ "$UI_ACTIVE" = yes ] || say ""
+        build_job_index quiet
+        show_detected_interfaces
+        say ""
+        say "Действия:"
         if [ "$JOB_COUNT" -eq 0 ]; then
             say "  1) Добавить задание"
             show_update_menu_item 2
@@ -1284,16 +1303,6 @@ main_menu() {
             say "  0) Выход"
         fi
         read_answer "Выберите действие" "0"
-        if [ "$UI_ACTIVE" = yes ] && [ "$REPLY" = i ]; then
-            ui_clear
-            show_detected_interfaces all
-            ui_pause
-            continue
-        fi
-        if [ "$UI_ACTIVE" = yes ] && [ "$REPLY" = n ] && [ "$JOB_COUNT" -gt 3 ]; then
-            JOB_PAGE=$(((JOB_PAGE + 1) % ((JOB_COUNT + 2) / 3)))
-            continue
-        fi
         if [ "$REPLY" != 0 ] && [ "$UI_ACTIVE" = yes ]; then
             # Preserve the selected action while repainting the action screen.
             menu_action=$REPLY
@@ -1310,9 +1319,9 @@ main_menu() {
                 *) say "Неизвестный пункт меню." ;;
             esac
             ui_pause
-            JOB_PAGE=0
             continue
         fi
+        ACTION_PAUSE=yes
         case "$REPLY" in
             1) configure_job add "" ;;
             2)
@@ -1327,8 +1336,7 @@ main_menu() {
             0) return 0 ;;
             *) say "Неизвестный пункт меню." ;;
         esac
-        ui_pause
-        JOB_PAGE=0
+        [ "$ACTION_PAUSE" = yes ] && ui_pause
     done
 }
 
@@ -1368,8 +1376,6 @@ rewrite_crontab || exit 1
 
 check_update_status
 show_update_notice
-show_detected_interfaces
-
 main_menu
 say "Выход из WG Watchdog."
 exit 0

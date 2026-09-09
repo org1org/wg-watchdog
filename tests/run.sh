@@ -451,18 +451,42 @@ fi
 assert_contains "$CRONTAB_PATH.wg-watchdog.bak" 'Wireguard9' "резервная копия cron"
 pass "crontab сохраняет чужие строки и исключает отключённые задания"
 
-# Задания визуально отличаются от пунктов меню: зелёный цвет и номер с точкой.
+# Включённые и выключенные задания имеют разные цвета и номер с точкой.
 COLOR_GREEN='<GREEN>'
+COLOR_RED='<RED>'
 COLOR_RESET='</GREEN>'
 NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
 build_job_index > "$MANAGER_ROOT/job-list"
 assert_contains "$MANAGER_ROOT/job-list" '<GREEN>1. Wireguard0' "формат номера задания"
+assert_contains "$MANAGER_ROOT/job-list" '<RED>2. Wireguard1' "цвет выключенного задания"
 if grep -F '<GREEN>1) Wireguard0' "$MANAGER_ROOT/job-list" >/dev/null; then
     fail "задание использует тот же формат номера, что и действие меню"
 fi
 COLOR_GREEN=''
+COLOR_RED=''
 COLOR_RESET=''
-pass "задания отображаются зелёным и нумеруются с точкой"
+pass "состояния заданий различаются цветом и нумеруются с точкой"
+
+# Каждый пункт, работающий с заданием, показывает список без выбора по Enter и позволяет вернуться.
+ACTION_ROOT="$TEST_ROOT/job-actions"
+mkdir -p "$ACTION_ROOT"
+for menu_action in 2 3 4 5 6; do
+    printf '%s\n\n0\n0\n' "$menu_action" > "$ACTION_ROOT/input"
+    INPUT_DEVICE="$ACTION_ROOT/input"
+    OUTPUT_DEVICE="$ACTION_ROOT/prompts"
+    open_console
+    if ! main_menu > "$ACTION_ROOT/output-$menu_action"; then
+        fail "пункт $menu_action не вернулся в главное меню"
+    fi
+    assert_contains "$ACTION_ROOT/output-$menu_action" '1. Wireguard0' "список задания для пункта $menu_action"
+    assert_contains "$ACTION_ROOT/output-$menu_action" '0) Вернуться в главное меню' "возврат из пункта $menu_action"
+    assert_contains "$ACTION_ROOT/output-$menu_action" 'Введите номер от 1 до 2 или 0 для возврата.' "Enter без значения для пункта $menu_action"
+    if grep -F 'Какое задание' "$OUTPUT_DEVICE" | grep -F '[1]' >/dev/null 2>&1 || \
+       grep -F 'Выберите задание [1]' "$OUTPUT_DEVICE" >/dev/null 2>&1; then
+        fail "в пункте $menu_action осталось задание по умолчанию"
+    fi
+done
+pass "все действия показывают задания, не выбирают первое по Enter и имеют возврат"
 
 # Повторная сборка идентичного crontab не меняет файл и резервную копию.
 cron_inode_before=$(ls -i "$CRONTAB_PATH" | awk '{ print $1 }')
@@ -523,10 +547,23 @@ assert_contains "$TEST_ROOT/header" 'WG Watchdog Manager' "заголовок"
 assert_contains "$TEST_ROOT/header" 'Автор: org1org' "автор"
 assert_contains "$TEST_ROOT/header" "Версия: $VERSION" "версия в шапке"
 NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
-show_detected_interfaces > "$TEST_ROOT/interfaces"
-assert_contains "$TEST_ROOT/interfaces" 'Найденные WireGuard-интерфейсы:' "заголовок интерфейсов"
-assert_contains "$TEST_ROOT/interfaces" 'Wireguard0 — Удалённый офис' "найденный интерфейс"
-pass "шапка и список интерфейсов содержат нужную информацию"
+(
+    cat > "$CONFIG_DIR/Wireguard2.conf" <<'EOF'
+JOB_ID='Wireguard2'
+WG_INTERFACE='Wireguard2'
+ENABLED='no'
+EOF
+    COLOR_GREEN='<GREEN>'
+    COLOR_RED='<RED>'
+    COLOR_GRAY='<GRAY>'
+    COLOR_RESET='</COLOR>'
+    show_detected_interfaces > "$TEST_ROOT/interfaces"
+)
+assert_contains "$TEST_ROOT/interfaces" 'WireGuard-интерфейсы:' "заголовок интерфейсов"
+assert_contains "$TEST_ROOT/interfaces" '<GREEN>  Wireguard0 — включена · Удалённый офис' "включённый интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<RED>  Wireguard2 — выключена · без описания' "выключенный интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<GRAY>  Wireguard3 — Два пира</COLOR>' "ненастроенный интерфейс"
+pass "все интерфейсы показываются со статусом и цветом проверки"
 
 # Набор действий зависит от наличия настроенных заданий.
 MENU_ROOT="$TEST_ROOT/menu"
@@ -644,7 +681,7 @@ installer_env() {
 }
 installer_env > "$INSTALL_ROOT/first-output"
 assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.5.3 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.5.4 установлен.' "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -667,9 +704,9 @@ pass "повторная установочная команда только з
 
 : > "$INSTALL_ROOT/prompt"
 installer_env --force > "$INSTALL_ROOT/force-output"
-assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.5.3"' "принудительная переустановка менеджера"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.5.4"' "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.5.3 установлен.' "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.5.4 установлен.' "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.

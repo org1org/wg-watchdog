@@ -6,7 +6,7 @@ from PIL import Image, ImageDraw, ImageFont
 from terminal import run_case
 
 ROWS, COLS = 24, 80
-stream = run_case(jobs=3).split("\x1b[?1049l")[0]
+stream = run_case(jobs=3, disabled_jobs=[2]).split("\x1b[?1049l")[0]
 screen = [[(" ", "#e5e7eb") for _ in range(COLS)] for _ in range(ROWS)]
 row = col = 0
 color = "#e5e7eb"
@@ -31,7 +31,10 @@ for match in re.finditer(r"\x1b\[([0-9;?]*)([A-Za-z])|([^\x1b])", stream):
     elif command == "K" and values == "2" and row < ROWS:
         screen[row] = [(" ", color) for _ in range(COLS)]
     elif command == "m":
-        color = {"1;36": "#52d8eb", "1;32": "#55dc92", "1;33": "#f5c96a"}.get(values, "#e5e7eb")
+        color = {
+            "1;31": "#ff6b6b", "1;32": "#55dc92", "1;33": "#f5c96a",
+            "1;36": "#52d8eb", "1;90": "#94a3b8",
+        }.get(values, "#e5e7eb")
 
 font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 16)
 cell_width, cell_height = 10, 23
