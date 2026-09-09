@@ -39,6 +39,8 @@ jobs:
           TARGET_SHA: 5ace8bff8aa6c1eff05362d145d4d3fe7f195491
         run: |
           set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git cat-file -e "$TARGET_SHA^{commit}"
           if git rev-parse -q --verify refs/tags/v1.6.0 >/dev/null; then
             test "$(git rev-list -n 1 v1.6.0)" = "$TARGET_SHA"
