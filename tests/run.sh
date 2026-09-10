@@ -1587,4 +1587,19 @@ pass "обрыв загрузки не затрагивает установле
 )
 pass "найденное обновление перепроверяется и подтверждается по Enter"
 
+# KeeneticOS предоставляет системный журнал через ndmc, а не OpenWrt logread.
+(
+    select_job() {
+        SELECTED_JOB=Wireguard0
+        return 0
+    }
+    run_visible() { return 0; }
+    run_job_now > "$TEST_ROOT/manual-check-result"
+    assert_contains "$TEST_ROOT/manual-check-result" "ndmc -c 'show log' | grep wg-watchdog" "команда журнала Keenetic"
+)
+if grep -F 'logread' "$MANAGER" "$REPO_DIR/docs/keenetic-acceptance.md" >/dev/null 2>&1; then
+    fail "в подсказках осталась отсутствующая в KeeneticOS команда logread"
+fi
+pass "подсказки журнала используют ndmc KeeneticOS"
+
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"

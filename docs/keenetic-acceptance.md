@@ -38,7 +38,7 @@
 
 ```sh
 wgwm --plain
-logread | grep wg-watchdog
+ndmc -c "show log" | grep wg-watchdog
 sed -n '/BEGIN WG-WATCHDOG/,/END WG-WATCHDOG/p' /opt/etc/crontab
 ls -ldn /opt /opt/etc/wg-watchdog.d /tmp/wg-watchdog
 ```

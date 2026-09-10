@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.8.3"
+VERSION="1.8.4"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -23,6 +23,7 @@ LEGACY_CONFIG="$OPT_ROOT/etc/wg-watchdog.conf"
 CRONTAB_PATH="$OPT_ROOT/etc/crontab"
 CRON_INIT="$OPT_ROOT/etc/init.d/S10cron"
 NDMC_BIN="${WG_WATCHDOG_NDMC:-ndmc}"
+WATCHDOG_LOG_COMMAND="ndmc -c 'show log' | grep wg-watchdog"
 PING_BIN="${WG_WATCHDOG_PING:-ping}"
 PIDOF_BIN="${WG_WATCHDOG_PIDOF:-pidof}"
 SHA256_BIN="${WG_WATCHDOG_SHA256:-sha256sum}"
@@ -1580,11 +1581,11 @@ run_job_now() {
     result=$?
     if [ "$result" -eq 0 ]; then
         result_card success "Проверка $SELECTED_JOB завершена." \
-            "Подробности перезапусков: logread | grep wg-watchdog"
+            "Подробности перезапусков: $WATCHDOG_LOG_COMMAND"
     else
         result_card error "Проверка $SELECTED_JOB завершилась с кодом $result." \
             "Watchdog сообщил об ошибке выполнения." \
-            "Посмотрите системный журнал: logread | grep wg-watchdog"
+            "Посмотрите системный журнал: $WATCHDOG_LOG_COMMAND"
     fi
 }
 
