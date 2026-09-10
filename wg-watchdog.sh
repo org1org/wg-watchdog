@@ -2,7 +2,7 @@
 
 # WG Watchdog for KeeneticOS + Entware
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-/opt/etc/wg-watchdog.d}"
 STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
@@ -49,6 +49,14 @@ is_integer_between() {
     is_positive_integer "$1" && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
 }
 
+valid_address() {
+    case "$1" in
+        ''|*[!0-9A-Za-z.:-]*) return 1 ;;
+        *[0-9A-Za-z]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 load_config() {
     JOB_ID=""
     WG_INTERFACE=""
@@ -59,6 +67,8 @@ load_config() {
     RESTART_DELAY=""
     CHECK_INTERVAL=""
     INTERNET_CHECK=""
+    INTERNET_CHECK_TARGET_1=""
+    INTERNET_CHECK_TARGET_2=""
     FAILURE_THRESHOLD=""
     RESTART_COOLDOWN=""
     BOOT_GRACE=""
@@ -91,6 +101,8 @@ load_config() {
             RESTART_DELAY) RESTART_DELAY=$config_value ;;
             CHECK_INTERVAL) CHECK_INTERVAL=$config_value ;;
             INTERNET_CHECK) INTERNET_CHECK=$config_value ;;
+            INTERNET_CHECK_TARGET_1) INTERNET_CHECK_TARGET_1=$config_value ;;
+            INTERNET_CHECK_TARGET_2) INTERNET_CHECK_TARGET_2=$config_value ;;
             FAILURE_THRESHOLD) FAILURE_THRESHOLD=$config_value ;;
             RESTART_COOLDOWN) RESTART_COOLDOWN=$config_value ;;
             BOOT_GRACE) BOOT_GRACE=$config_value ;;
@@ -280,6 +292,8 @@ fi
 : "${RECOVERY_CHECK_DELAY:=15}"
 : "${WG_SERVER_PUBLIC_IP:=}"
 : "${INTERNET_CHECK:=yes}"
+: "${INTERNET_CHECK_TARGET_1:=1.1.1.1}"
+: "${INTERNET_CHECK_TARGET_2:=8.8.8.8}"
 
 if [ "${ENABLED:-no}" != "yes" ] && [ "$FORCE" != "yes" ]; then
     exit 0
@@ -287,7 +301,8 @@ fi
 
 if [ "${JOB_ID:-}" != "$REQUESTED_JOB" ] || \
    [ "${WG_INTERFACE:-}" != "$REQUESTED_JOB" ] || \
-   [ -z "${WG_SERVER_TUNNEL_IP:-}" ]; then
+   ! valid_address "${WG_SERVER_TUNNEL_IP:-}" || \
+   { [ -n "${WG_SERVER_PUBLIC_IP:-}" ] && ! valid_address "$WG_SERVER_PUBLIC_IP"; }; then
     log_message "[$REQUESTED_JOB] файл настроек повреждён или не соответствует заданию"
     exit 1
 fi
@@ -310,6 +325,11 @@ case "$INTERNET_CHECK" in
     yes|no) ;;
     *) log_message "[$JOB_ID] в настройках найден недопустимый режим проверки интернета"; exit 1 ;;
 esac
+valid_address "$INTERNET_CHECK_TARGET_1" && \
+valid_address "$INTERNET_CHECK_TARGET_2" || {
+    log_message "[$JOB_ID] контрольные адреса интернета имеют недопустимый формат"
+    exit 1
+}
 
 acquire_lock
 lock_result=$?
@@ -350,7 +370,8 @@ fi
 
 # Если обычный интернет недоступен, перезапуск туннеля не поможет.
 if [ "$INTERNET_CHECK" = yes ] && \
-   ! ping_target 1 1.1.1.1 && ! ping_target 1 8.8.8.8; then
+   ! ping_target 1 "$INTERNET_CHECK_TARGET_1" && \
+   ! ping_target 1 "$INTERNET_CHECK_TARGET_2"; then
     CONSECUTIVE_FAILURES=0
     record_transition "обычный интернет недоступен" \
         "[$JOB_ID] интернет недоступен — перезапуск $WG_INTERFACE пропущен"

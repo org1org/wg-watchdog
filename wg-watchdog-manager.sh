@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -182,6 +182,7 @@ say() {
     if [ "$UI_ACTIVE" = yes ]; then ui_text "$*"; else printf '%s\n' "$*"; fi
 }
 info() { say "${COLOR_GREEN}$*${COLOR_RESET}"; }
+warn() { say "${COLOR_YELLOW}ВНИМАНИЕ: $*${COLOR_RESET}"; }
 
 result_card() {
     result_kind=$1
@@ -268,7 +269,7 @@ end_maintenance() {
 begin_maintenance() {
     mkdir -p "$RUN_DIR" || die "не удалось подготовить каталог блокировок"
     mkdir "$RUN_DIR/maintenance.lock" 2>/dev/null || {
-        say "Уже выполняется обслуживание. Повторите позже."
+        warn "Уже выполняется обслуживание. Повторите позже."
         return 1
     }
     MAINTENANCE_HELD=yes
@@ -289,7 +290,7 @@ begin_maintenance() {
         [ "$active_jobs" = yes ] || return 0
         if [ "$wait_elapsed" -ge "$WAIT_SECONDS" ]; then
             end_maintenance
-            say "Проверка ещё выполняется или блокировка не завершена. Изменения отменены."
+            warn "Проверка ещё выполняется или блокировка не завершена. Изменения отменены."
             return 1
         fi
         [ "$wait_elapsed" -ne 0 ] || info "Ожидаю завершения работающих проверок (до $WAIT_SECONDS сек.)..."
@@ -357,7 +358,8 @@ valid_interface() {
 valid_address() {
     case "$1" in
         ''|*[!0-9A-Za-z.:-]*) return 1 ;;
-        *) return 0 ;;
+        *[0-9A-Za-z]*) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -543,12 +545,12 @@ ensure_short_command() {
         return 0
     fi
     if [ -e "$SHORT_COMMAND" ] || [ -L "$SHORT_COMMAND" ]; then
-        say "Предупреждение: $SHORT_COMMAND уже занят; используйте $MANAGER_PATH."
+        warn "$SHORT_COMMAND уже занят; используйте $MANAGER_PATH."
         return 0
     fi
     existing_command=$(command -v wgwm 2>/dev/null || true)
     if [ -n "$existing_command" ]; then
-        say "Предупреждение: команда wgwm уже занята ($existing_command); она не изменена."
+        warn "Команда wgwm уже занята ($existing_command); она не изменена."
         return 0
     fi
     ln -s "$MANAGER_PATH" "$SHORT_COMMAND" || die "не удалось создать команду wgwm"
@@ -621,7 +623,7 @@ rollback_update() {
     mv "$UPDATE_DIR/manager.restore" "$MANAGER_PATH" || return 1
     sync_update_storage || return 1
     if ! clear_update_dir; then
-        say "Предупреждение: служебные файлы обновления будут очищены при следующем запуске."
+        warn "Служебные файлы обновления будут очищены при следующем запуске."
     fi
     return 0
 }
@@ -793,7 +795,7 @@ show_update_notice() {
         say "${COLOR_YELLOW}ДОСТУПНА НОВАЯ ВЕРСИЯ: $VERSION → $REMOTE_VERSION${COLOR_RESET}"
         say "Выберите обновление в основном меню."
     elif [ "$UPDATE_AVAILABLE" = "unknown" ]; then
-        say "Обновления проверить не удалось; локальное управление доступно."
+        warn "Обновления проверить не удалось; локальное управление доступно."
     fi
 }
 
@@ -999,6 +1001,8 @@ reset_config_values() {
     RESTART_DELAY=""
     CHECK_INTERVAL=""
     INTERNET_CHECK=""
+    INTERNET_CHECK_TARGET_1=""
+    INTERNET_CHECK_TARGET_2=""
     WG_SERVER_PUBLIC_IP=""
     FAILURE_THRESHOLD=""
     RESTART_COOLDOWN=""
@@ -1038,6 +1042,8 @@ load_config() {
             RESTART_DELAY) RESTART_DELAY=$config_value ;;
             CHECK_INTERVAL) CHECK_INTERVAL=$config_value ;;
             INTERNET_CHECK) INTERNET_CHECK=$config_value ;;
+            INTERNET_CHECK_TARGET_1) INTERNET_CHECK_TARGET_1=$config_value ;;
+            INTERNET_CHECK_TARGET_2) INTERNET_CHECK_TARGET_2=$config_value ;;
             FAILURE_THRESHOLD) FAILURE_THRESHOLD=$config_value ;;
             RESTART_COOLDOWN) RESTART_COOLDOWN=$config_value ;;
             BOOT_GRACE) BOOT_GRACE=$config_value ;;
@@ -1069,6 +1075,8 @@ PING_TIMEOUT='$PING_TIMEOUT'
 RESTART_DELAY='$RESTART_DELAY'
 CHECK_INTERVAL='$CHECK_INTERVAL'
 INTERNET_CHECK='$INTERNET_CHECK'
+INTERNET_CHECK_TARGET_1='$INTERNET_CHECK_TARGET_1'
+INTERNET_CHECK_TARGET_2='$INTERNET_CHECK_TARGET_2'
 FAILURE_THRESHOLD='$FAILURE_THRESHOLD'
 RESTART_COOLDOWN='$RESTART_COOLDOWN'
 BOOT_GRACE='$BOOT_GRACE'
@@ -1123,7 +1131,7 @@ rewrite_crontab() (
         config_name=${config_file##*/}
         expected_job=${config_name%.conf}
         load_config "$config_file" "$expected_job" || {
-            say "Предупреждение: пропущен повреждённый файл ${config_file##*/}."
+            warn "Пропущен повреждённый файл ${config_file##*/}."
             continue
         }
         if [ "$ENABLED" = "yes" ] && valid_interface "$JOB_ID" && \
@@ -1172,20 +1180,22 @@ migrate_legacy_config() {
     [ "$existing_count" -eq 0 ] || return 0
 
     if ! load_config "$LEGACY_CONFIG"; then
-        say "Предупреждение: старая конфигурация имеет недопустимый формат."
+        warn "Старая конфигурация имеет недопустимый формат."
         return 0
     fi
     normalize_parameters "" || die "внутренняя ошибка схемы параметров"
     if valid_interface "$WG_INTERFACE" && valid_address "$WG_SERVER_TUNNEL_IP"; then
         JOB_ID=$WG_INTERFACE
         INTERNET_CHECK=yes
+        INTERNET_CHECK_TARGET_1=1.1.1.1
+        INTERNET_CHECK_TARGET_2=8.8.8.8
         WG_SERVER_PUBLIC_IP=""
         ENABLED=yes
         write_config
         mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.migrated-v1.0.0"
         say "Конфигурация v1.0.0 перенесена в актуальный формат."
     else
-        say "Предупреждение: старую конфигурацию не удалось перенести автоматически."
+        warn "Старую конфигурацию не удалось перенести автоматически."
     fi
 }
 
@@ -1195,7 +1205,7 @@ upgrade_config_files() {
         config_name=${config_file##*/}
         expected_job=${config_name%.conf}
         load_config "$config_file" "$expected_job" || {
-            say "Предупреждение: файл ${config_file##*/} повреждён и не изменён."
+            warn "Файл ${config_file##*/} повреждён и не изменён."
             continue
         }
         valid_interface "$JOB_ID" || continue
@@ -1205,6 +1215,16 @@ upgrade_config_files() {
         WG_SERVER_PUBLIC_IP=${WG_SERVER_PUBLIC_IP:-}
         # Jobs created before v1.7.0 keep their former external-network gate.
         case "${INTERNET_CHECK:-}" in yes|no) ;; *) INTERNET_CHECK=yes ;; esac
+        INTERNET_CHECK_TARGET_1=${INTERNET_CHECK_TARGET_1:-1.1.1.1}
+        INTERNET_CHECK_TARGET_2=${INTERNET_CHECK_TARGET_2:-8.8.8.8}
+        if ! valid_address "$INTERNET_CHECK_TARGET_1"; then
+            INTERNET_CHECK_TARGET_1=1.1.1.1
+            say "Контрольный адрес 1 задания $JOB_ID заменён на 1.1.1.1."
+        fi
+        if ! valid_address "$INTERNET_CHECK_TARGET_2"; then
+            INTERNET_CHECK_TARGET_2=8.8.8.8
+            say "Контрольный адрес 2 задания $JOB_ID заменён на 8.8.8.8."
+        fi
         [ "$ENABLED" = "yes" ] || ENABLED=no
         write_config
     done
@@ -1223,6 +1243,8 @@ configure_job() {
         old_interface=$WG_INTERFACE
         default_server=$WG_SERVER_TUNNEL_IP
         default_internet_check=${INTERNET_CHECK:-yes}
+        default_internet_target_1=${INTERNET_CHECK_TARGET_1:-1.1.1.1}
+        default_internet_target_2=${INTERNET_CHECK_TARGET_2:-8.8.8.8}
         default_public_ip=${WG_SERVER_PUBLIC_IP:-}
         old_enabled=$ENABLED
     else
@@ -1230,6 +1252,8 @@ configure_job() {
         default_server=""
         apply_default_parameters || die "внутренняя ошибка схемы параметров"
         default_internet_check=no
+        default_internet_target_1=1.1.1.1
+        default_internet_target_2=8.8.8.8
         default_public_ip=""
         old_enabled=yes
     fi
@@ -1325,7 +1349,7 @@ configure_job() {
         if "$PING_BIN" -c 1 -W 3 "$WG_SERVER_PUBLIC_IP" >/dev/null 2>&1; then
             say "Публичный адрес WG-сервера отвечает."
         else
-            say "Предупреждение: публичный адрес не ответил. Если ICMP на нём запрещён,"
+            warn "Публичный адрес не ответил. Если ICMP на нём запрещён,"
             say "лучше оставить это поле пустым, иначе watchdog будет пропускать восстановление."
             confirm "Сохранить этот публичный адрес несмотря на отсутствие ответа?" || \
                 WG_SERVER_PUBLIC_IP=""
@@ -1334,7 +1358,7 @@ configure_job() {
 
     if [ "$mode" = "edit" ]; then
         say ""
-        say "Проверка обычного интернета по 1.1.1.1 и 8.8.8.8 может запретить"
+        say "Проверка обычного интернета по двум контрольным адресам может запретить"
         say "восстановление, если эти адреса маршрутизируются через сам WireGuard."
         say "Для full-tunnel её следует оставить выключенной."
         if [ "$default_internet_check" = yes ]; then
@@ -1348,8 +1372,30 @@ configure_job() {
         else
             INTERNET_CHECK=no
         fi
+        INTERNET_CHECK_TARGET_1=$default_internet_target_1
+        INTERNET_CHECK_TARGET_2=$default_internet_target_2
+        if [ "$INTERNET_CHECK" = yes ]; then
+            while :; do
+                read_answer "Контрольный адрес 1 (IP или DNS-имя)" "$default_internet_target_1"
+                if valid_address "$REPLY"; then
+                    INTERNET_CHECK_TARGET_1=$REPLY
+                    break
+                fi
+                say "Введите IP-адрес или DNS-имя без пробелов."
+            done
+            while :; do
+                read_answer "Контрольный адрес 2 (IP или DNS-имя)" "$default_internet_target_2"
+                if valid_address "$REPLY"; then
+                    INTERNET_CHECK_TARGET_2=$REPLY
+                    break
+                fi
+                say "Введите IP-адрес или DNS-имя без пробелов."
+            done
+        fi
     else
         INTERNET_CHECK=$default_internet_check
+        INTERNET_CHECK_TARGET_1=$default_internet_target_1
+        INTERNET_CHECK_TARGET_2=$default_internet_target_2
     fi
 
     if [ "$mode" = "edit" ]; then
@@ -1509,6 +1555,7 @@ show_job_status() {
     say "  Частота проверки:         $CHECK_INTERVAL мин."
     if [ "$INTERNET_CHECK" = yes ]; then
         say "  Проверка интернета:       включена"
+        say "  Контрольные адреса:       $INTERNET_CHECK_TARGET_1, $INTERNET_CHECK_TARGET_2"
     else
         say "  Проверка интернета:       выключена"
     fi
@@ -1549,7 +1596,7 @@ remove_managed_cron() {
     mv "$clean_file" "$CRONTAB_PATH" || die "не удалось сохранить crontab"
     if [ -x "$CRON_INIT" ]; then
         "$CRON_INIT" restart >/dev/null 2>&1 || \
-            say "Предупреждение: не удалось перезапустить cron."
+            warn "Не удалось перезапустить cron."
     fi
 }
 
@@ -1676,7 +1723,7 @@ EOF
 
 show_update_menu_item() {
     if [ "$UPDATE_AVAILABLE" = "yes" ]; then
-        say "  $1) Обновить программу до версии $REMOTE_VERSION"
+        say "${COLOR_GREEN}  $1) Обновить программу до версии $REMOTE_VERSION${COLOR_RESET}"
     else
         say "  $1) Проверить обновления"
     fi

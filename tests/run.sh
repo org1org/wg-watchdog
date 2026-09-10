@@ -79,6 +79,8 @@ PING_TIMEOUT='3'
 RESTART_DELAY='3'
 CHECK_INTERVAL='5'
 INTERNET_CHECK='$internet_check'
+INTERNET_CHECK_TARGET_1='1.1.1.1'
+INTERNET_CHECK_TARGET_2='8.8.8.8'
 FAILURE_THRESHOLD='$threshold'
 RESTART_COOLDOWN='30'
 BOOT_GRACE='180'
@@ -178,7 +180,42 @@ assert_equal "$LAST_RESULT" "обычный интернет недоступе�
 assert_empty "$MOCK_DIR/ndmc.log" "без интернета restart не нужен"
 pass "отсутствие интернета корректно отделяется от ошибки WG"
 
+# Контрольные адреса обычного интернета можно изменить для каждого задания.
+new_case
+write_config 10.0.0.1 "" 2 yes yes
+sed -i "s/INTERNET_CHECK_TARGET_1='1.1.1.1'/INTERNET_CHECK_TARGET_1='resolver-one.test'/" "$CONFIG_DIR/Wireguard0.conf"
+sed -i "s/INTERNET_CHECK_TARGET_2='8.8.8.8'/INTERNET_CHECK_TARGET_2='resolver-two.test'/" "$CONFIG_DIR/Wireguard0.conf"
+run_watchdog custom_internet_down 5400 --force >/dev/null
+load_test_state
+assert_equal "$LAST_RESULT" "обычный интернет недоступен" "пользовательские контрольные адреса"
+assert_contains "$MOCK_DIR/ping.log" 'custom_internet_down | resolver-one.test' "первый контрольный адрес"
+assert_contains "$MOCK_DIR/ping.log" 'custom_internet_down | resolver-two.test' "второй контрольный адрес"
+assert_empty "$MOCK_DIR/ndmc.log" "отказ контрольных адресов не должен перезапускать WG"
+pass "watchdog использует пользовательские контрольные адреса интернета"
+
+new_case
+write_config 10.0.0.1 "" 2 yes yes
+sed -i "s/INTERNET_CHECK_TARGET_1='1.1.1.1'/INTERNET_CHECK_TARGET_1='-'/" "$CONFIG_DIR/Wireguard0.conf"
+if run_watchdog healthy 5425 --force >/dev/null; then
+    fail "контрольный адрес без букв и цифр был принят"
+fi
+assert_contains "$MOCK_DIR/logger.log" 'контрольные адреса интернета имеют недопустимый формат' "валидация контрольного адреса"
+assert_empty "$MOCK_DIR/ndmc.log" "ошибочный контрольный адрес не должен вызывать ndmc"
+pass "watchdog отклоняет бессмысленные контрольные адреса"
+
+new_case
+write_config 10.0.0.1 "" 2 yes yes
+sed -i "s/INTERNET_CHECK_TARGET_1='1.1.1.1'/INTERNET_CHECK_TARGET_1='resolver-one.test'/" "$CONFIG_DIR/Wireguard0.conf"
+sed -i "s/INTERNET_CHECK_TARGET_2='8.8.8.8'/INTERNET_CHECK_TARGET_2='resolver-two.test'/" "$CONFIG_DIR/Wireguard0.conf"
+run_watchdog custom_one_down 5450 --force >/dev/null
+load_test_state
+assert_equal "$LAST_RESULT" "туннель работает" "резервный контрольный адрес"
+pass "ответ любого из двух контрольных адресов подтверждает доступность интернета"
+
 # Одинаковая длительная ошибка пишется в системный журнал только один раз.
+new_case
+write_config 10.0.0.1 "" 2 yes
+run_watchdog internet_down 5500 --force >/dev/null
 run_watchdog internet_down 5600 --force > "$CASE_DIR/manual-repeat"
 internet_log_count=$(grep -c 'интернет недоступен' "$MOCK_DIR/logger.log" || true)
 assert_equal "$internet_log_count" 1 "подавление повторного логирования"
@@ -390,6 +427,11 @@ if valid_parameter_value PING_COUNT 03; then fail "ведущий ноль пр�
 if parameter_spec UNKNOWN_PARAMETER; then fail "неизвестный параметр принят схемой"; fi
 pass "единая схема задаёт имена, значения, границы и описания"
 
+valid_address resolver.example || fail "DNS-имя отклонено"
+valid_address 2001:db8::1 || fail "IPv6-адрес отклонён"
+if valid_address -; then fail "адрес без букв и цифр принят"; fi
+pass "адреса допускают IP и DNS-имена, но не бессмысленные строки"
+
 valid_interval 5 || fail "интервал 5 отклонён"
 valid_interval 60 || fail "интервал 60 отклонён"
 if valid_interval 7; then fail "неточный интервал 7 принят"; fi
@@ -511,6 +553,8 @@ assert_contains "$CONFIG_DIR/Wireguard0.conf" "PING_COUNT='3'" "PING_COUNT по 
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "CHECK_INTERVAL='5'" "CHECK_INTERVAL по умолчанию"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "порог по умолчанию"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='no'" "безопасный режим full-tunnel"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_1='1.1.1.1'" "первый контрольный адрес по умолчанию"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_2='8.8.8.8'" "второй контрольный адрес по умолчанию"
 if grep -F 'PING_COUNT —' "$OUTPUT_DEVICE" >/dev/null || \
    grep -F 'CHECK_INTERVAL —' "$OUTPUT_DEVICE" >/dev/null; then
     fail "при создании задания запрошены числовые параметры"
@@ -528,6 +572,17 @@ if grep -F 'Выберите номер интерфейса' "$OUTPUT_DEVICE" >
 fi
 assert_contains "$OUTPUT_DEVICE" 'Введите внутренний IP-адрес WireGuard-сервера' "диалог редактирования"
 pass "редактирование сохраняет интерфейс без повторного выбора"
+
+# При включении внешней проверки пользователь задаёт собственные адреса.
+printf '\n\ny\nresolver-one.test\nresolver-two.test\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+open_console
+configure_job edit Wireguard0 >/dev/null
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='yes'" "включение проверки интернета"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_1='resolver-one.test'" "изменение первого адреса"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_2='resolver-two.test'" "изменение второго адреса"
+assert_contains "$OUTPUT_DEVICE" 'Контрольный адрес 1 (IP или DNS-имя)' "запрос первого адреса"
+assert_contains "$OUTPUT_DEVICE" 'Контрольный адрес 2 (IP или DNS-имя)' "запрос второго адреса"
+pass "менеджер позволяет изменить контрольные IP или DNS-имена"
 
 # Явный yes включает проверку и предлагает Endpoint в качестве адреса.
 prepare_dialog_case manager-public-opt-in
@@ -563,6 +618,8 @@ assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "мигр�
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "RESTART_COOLDOWN='30'" "миграция cooldown"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "CHECK_INTERVAL='5'" "нормализация интервала"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='yes'" "сохранение прежней сетевой логики"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_1='1.1.1.1'" "миграция первого контрольного адреса"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_2='8.8.8.8'" "миграция второго контрольного адреса"
 pass "старая конфигурация обновляется без молчаливой смены сетевой логики"
 
 # Повторный запуск миграции не перезаписывает неизменившийся файл на /opt.
@@ -636,11 +693,15 @@ result_card error "Проверка не выполнена." > "$MANAGER_ROOT/r
 assert_contains "$MANAGER_ROOT/result-error" '<RED>ОШИБКА: Проверка не выполнена.</COLOR>' "карточка ошибки"
 result_card cancelled "Изменений нет." > "$MANAGER_ROOT/result-cancelled"
 assert_contains "$MANAGER_ROOT/result-cancelled" '<GRAY>ОТМЕНЕНО: Изменений нет.</COLOR>' "карточка отмены"
+COLOR_YELLOW='<YELLOW>'
+warn "Cron недоступен." > "$MANAGER_ROOT/warning"
+assert_contains "$MANAGER_ROOT/warning" '<YELLOW>ВНИМАНИЕ: Cron недоступен.</COLOR>' "единый формат предупреждения"
 COLOR_GREEN=''
 COLOR_RED=''
 COLOR_GRAY=''
+COLOR_YELLOW=''
 COLOR_RESET=''
-pass "результаты действий используют единые карточки"
+pass "результаты действий и предупреждения используют единый формат"
 
 # Каждый пункт, работающий с заданием, показывает список без выбора по Enter и позволяет вернуться.
 ACTION_ROOT="$TEST_ROOT/job-actions"
@@ -708,6 +769,16 @@ printf 'EXTRA=value\n' >> "$TEST_ROOT/remote-release"
 check_update_status
 assert_equal "$UPDATE_AVAILABLE" unknown "лишнее поле манифеста"
 pass "обновление использует строгий манифест и корректное сравнение версий"
+
+COLOR_GREEN='<GREEN>'
+COLOR_RESET='</COLOR>'
+UPDATE_AVAILABLE=yes
+REMOTE_VERSION=1.8.1
+show_update_menu_item 7 > "$TEST_ROOT/update-menu-item"
+assert_contains "$TEST_ROOT/update-menu-item" '<GREEN>  7) Обновить программу до версии 1.8.1</COLOR>' "цвет доступного обновления"
+COLOR_GREEN=''
+COLOR_RESET=''
+pass "доступное обновление выделяется зелёным в меню"
 
 # Короткая команда создаётся только в свободном месте и не затирает коллизию.
 SHORT_COMMAND="$TEST_ROOT/bin-free/wgwm"
@@ -936,7 +1007,7 @@ chmod 755 "$INSTALL_MOCK_BIN/id" "$INSTALL_MOCK_BIN/wget"
 watchdog_release_hash=$(sha256sum "$WATCHDOG" | awk '{ print $1 }')
 manager_release_hash=$(sha256sum "$MANAGER" | awk '{ print $1 }')
 cat > "$INSTALL_ROOT/RELEASE" <<EOF
-VERSION=1.8.0
+VERSION=$manager_version
 COMMIT=0123456789abcdef0123456789abcdef01234567
 WATCHDOG_SHA256=$watchdog_release_hash
 MANAGER_SHA256=$manager_release_hash
@@ -961,7 +1032,7 @@ installer_env() {
 }
 installer_env > "$INSTALL_ROOT/first-output"
 assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.8.0 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" "WG Watchdog $manager_version установлен." "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -984,9 +1055,9 @@ pass "повторная установочная команда только з
 
 : > "$INSTALL_ROOT/prompt"
 installer_env --force > "$INSTALL_ROOT/force-output"
-assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.8.0"' "принудительная переустановка менеджера"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" "VERSION=\"$manager_version\"" "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.8.0 установлен.' "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" "WG Watchdog $manager_version установлен." "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.
