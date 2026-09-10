@@ -8,6 +8,7 @@ interface Wireguard0
  description "Удалённый офис"
  security-level private
  ip address 10.0.0.2 255.255.255.255
+ wireguard listen-port 16669
  wireguard peer abcdefghijklmnopqrstuvwxyz0123456789ABCDE=
  endpoint 198.51.100.10:36666
  allow-ips 10.0.0.1 255.255.255.255

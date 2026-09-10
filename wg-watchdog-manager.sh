@@ -869,6 +869,32 @@ interface_description() {
     REPLY=$result
 }
 
+interface_listen_port() {
+    listen_interface=$1
+    result=$(printf '%s\n' "$RUNNING_CONFIG" | awk -v wanted="$listen_interface" '
+        $1 == "interface" {
+            if (in_target) exit
+            in_target = ($2 == wanted)
+            next
+        }
+        in_target && $1 == "wireguard" && $2 == "listen-port" && \
+            $3 ~ /^[0-9]+$/ && $3 > 0 && $3 <= 65535 {
+            print $3
+            exit
+        }
+    ')
+    REPLY=$result
+}
+
+show_listen_port_warning() {
+    interface_listen_port "$1"
+    [ -n "$REPLY" ] || return 0
+    FIXED_LISTEN_PORT=$REPLY
+    warn "На $1 задан фиксированный локальный порт WireGuard: $FIXED_LISTEN_PORT."
+    say "Для исходящего клиентского туннеля рекомендуется оставить «Порт прослушивания» пустым."
+    say "Не путайте его с портом сервера в Endpoint — серверный порт удалять нельзя."
+}
+
 choose_interface() {
     current=${1:-}
     detect_interfaces
@@ -1279,6 +1305,8 @@ configure_job() {
         return 1
     fi
 
+    show_listen_port_warning "$WG_INTERFACE"
+
     if [ "$mode" = "add" ]; then
         detect_peer_defaults "$WG_INTERFACE"
     else
@@ -1321,7 +1349,11 @@ configure_job() {
         }
     fi
 
-    say ""
+    if [ "$UI_ACTIVE" = yes ]; then
+        ui_clear
+    else
+        say ""
+    fi
     say "Необязательная проверка публичного адреса помогает отличить отключённый"
     say "сервер от неисправного туннеля. Включайте её только если публичный адрес"
     say "стабильно отвечает на ping: иначе watchdog может пропустить восстановление."
@@ -1554,11 +1586,19 @@ show_job_status() {
         . "$state_file"
     fi
     if [ "$ENABLED" = "yes" ]; then state="включено"; else state="выключено"; fi
+    detect_interfaces
+    interface_listen_port "$WG_INTERFACE"
+    status_listen_port=$REPLY
     say ""
     say "Статус $SELECTED_JOB:"
     say "  Состояние задания:        $state"
     say "  Внутренний адрес сервера: $WG_SERVER_TUNNEL_IP"
     say "  Публичный адрес сервера:  ${WG_SERVER_PUBLIC_IP:-не используется}"
+    if [ -n "$status_listen_port" ]; then
+        say "  Локальный порт WG:        $status_listen_port (фиксированный)"
+    else
+        say "  Локальный порт WG:        автоматический"
+    fi
     say "  Частота проверки:         $CHECK_INTERVAL мин."
     if [ "$INTERNET_CHECK" = yes ]; then
         say "  Проверка интернета:       включена"
@@ -1572,6 +1612,9 @@ show_job_status() {
     say "  Последний перезапуск:     $LAST_RESTART_TEXT"
     say "  Ошибок подряд:            $CONSECUTIVE_FAILURES из $FAILURE_THRESHOLD"
     say "  Cooldown:                  $RESTART_COOLDOWN мин."
+    if [ -n "$status_listen_port" ]; then
+        warn "Для исходящего клиента фиксированный локальный порт может мешать восстановлению после обрыва."
+    fi
 }
 
 run_job_now() {

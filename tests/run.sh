@@ -457,6 +457,13 @@ if printf '%s\n' "$INTERFACE_LIST" | grep -F 'GigabitEthernet0' >/dev/null; then
 fi
 pass "парсер находит интерфейсы WireGuard и их описания"
 
+interface_listen_port Wireguard0
+assert_equal "$REPLY" 16669 "фиксированный локальный порт"
+interface_listen_port Wireguard2
+assert_empty_port=$REPLY
+assert_equal "$assert_empty_port" "" "автоматический локальный порт"
+pass "парсер различает фиксированный и автоматический listen-port"
+
 # Адреса сервера извлекаются из endpoint и одиночного маршрута allow-ips.
 detect_peer_defaults Wireguard0
 assert_equal "$DETECTED_PUBLIC_IP" "198.51.100.10" "IPv4 endpoint"
@@ -564,7 +571,28 @@ if grep -F 'PING_COUNT —' "$OUTPUT_DEVICE" >/dev/null || \
 fi
 assert_contains "$DIALOG_ROOT/output" 'Применены рекомендуемые параметры:' "summary параметров задания"
 assert_contains "$DIALOG_ROOT/output" 'Изменить эти значения можно' "подсказка редактирования"
+assert_contains "$DIALOG_ROOT/output" 'фиксированный локальный порт WireGuard: 16669' "предупреждение listen-port"
 pass "новое задание получает рекомендуемые параметры без лишних вопросов"
+
+# Полноэкранный режим начинает раздел публичной проверки с новой страницы,
+# чтобы пояснение и вопрос не разделялись автоматической очисткой экрана.
+(
+    prepare_dialog_case manager-public-page
+    printf '1\n\n\n' > "$INPUT_DEVICE"
+    open_console
+    UI_ACTIVE=yes
+    ui_clear() { printf '<CLEAR>\n'; }
+    ui_text() { printf '<TEXT>%s\n' "$*"; }
+    ui_prompt() { printf '<PROMPT>%s\n' "$*"; }
+    configure_job add "" > "$DIALOG_ROOT/page-output"
+    sed -n '/^<CLEAR>$/,/^<PROMPT>Использовать проверку публичного адреса?/p' \
+        "$DIALOG_ROOT/page-output" > "$DIALOG_ROOT/public-section"
+    assert_contains "$DIALOG_ROOT/public-section" 'Необязательная проверка публичного адреса' "пояснение на странице публичной проверки"
+    assert_contains "$DIALOG_ROOT/public-section" '<PROMPT>Использовать проверку публичного адреса? [y/N]' "вопрос на странице публичной проверки"
+    clear_count=$(grep -c '^<CLEAR>$' "$DIALOG_ROOT/public-section")
+    assert_equal "$clear_count" 1 "очистка между пояснением и вопросом"
+)
+pass "пояснение и вопрос публичной проверки остаются на одном экране"
 
 # Редактирование существующего задания не спрашивает интерфейс повторно.
 printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
