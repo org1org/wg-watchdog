@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.8.2"
+VERSION="1.8.3"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -800,7 +800,11 @@ show_update_notice() {
 }
 
 perform_update() {
-    info "Проверяю наличие новой версии..."
+    if [ "$UPDATE_AVAILABLE" = "yes" ]; then
+        info "Перепроверяю наличие новой версии..."
+    else
+        info "Проверяю наличие новой версии..."
+    fi
     check_update_status
     if [ "$UPDATE_AVAILABLE" = "unknown" ]; then
         result_card warning "Не удалось проверить обновления." \
@@ -813,7 +817,7 @@ perform_update() {
         return 0
     fi
     say "Доступна версия $REMOTE_VERSION; установлена версия $VERSION."
-    confirm "Загрузить и установить обновление?" || {
+    confirm_yes "Загрузить и установить обновление?" || {
         result_card cancelled "Обновление не выполнялось."
         return 0
     }

@@ -1563,4 +1563,28 @@ pass "несовпадение SHA-256 отклоняется до замены 
 )
 pass "обрыв загрузки не затрагивает установленную пару файлов"
 
+# Если обновление уже показано в меню, действие повторно проверяет манифест,
+# а Enter подтверждает установку.
+(
+    INPUT_DEVICE="$TEST_ROOT/update-dialog-answer"
+    OUTPUT_DEVICE="$TEST_ROOT/update-dialog-prompt"
+    printf '\n' > "$INPUT_DEVICE"
+    : > "$OUTPUT_DEVICE"
+    open_console
+    UPDATE_AVAILABLE=yes
+    check_update_status() {
+        UPDATE_AVAILABLE=yes
+        REMOTE_VERSION=9.9.9
+    }
+    install_program_files() {
+        : > "$TEST_ROOT/update-dialog-install-called"
+        return 1
+    }
+    perform_update > "$TEST_ROOT/update-dialog-output"
+    assert_contains "$TEST_ROOT/update-dialog-output" 'Перепроверяю наличие новой версии...' "повторная проверка обновления"
+    assert_contains "$OUTPUT_DEVICE" 'Загрузить и установить обновление? [Y/n]' "обновление по Enter"
+    [ -f "$TEST_ROOT/update-dialog-install-called" ] || fail "Enter не подтвердил установку обновления"
+)
+pass "найденное обновление перепроверяется и подтверждается по Enter"
+
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"
