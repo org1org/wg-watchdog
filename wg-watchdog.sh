@@ -2,7 +2,7 @@
 
 # WG Watchdog for KeeneticOS + Entware
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-/opt/etc/wg-watchdog.d}"
 STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
@@ -33,20 +33,73 @@ log_message() {
 
 is_positive_integer() {
     case "$1" in
-        ''|*[!0-9]*|0) return 1 ;;
+        ''|*[!0-9]*|0|0[0-9]*) return 1 ;;
         *) return 0 ;;
     esac
 }
 
 is_nonnegative_integer() {
     case "$1" in
-        ''|*[!0-9]*) return 1 ;;
+        ''|*[!0-9]*|0[0-9]*) return 1 ;;
         *) return 0 ;;
     esac
 }
 
 is_integer_between() {
     is_positive_integer "$1" && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
+load_config() {
+    JOB_ID=""
+    WG_INTERFACE=""
+    WG_SERVER_TUNNEL_IP=""
+    WG_SERVER_PUBLIC_IP=""
+    PING_COUNT=""
+    PING_TIMEOUT=""
+    RESTART_DELAY=""
+    CHECK_INTERVAL=""
+    INTERNET_CHECK=""
+    FAILURE_THRESHOLD=""
+    RESTART_COOLDOWN=""
+    BOOT_GRACE=""
+    RECOVERY_CHECK_DELAY=""
+    ENABLED=""
+    [ -r "$CONFIG_FILE" ] || return 1
+    config_seen="|"
+    while IFS= read -r config_line || [ -n "$config_line" ]; do
+        case "$config_line" in
+            ''|\#*) continue ;;
+        esac
+        config_key=${config_line%%=*}
+        config_raw=${config_line#*=}
+        [ "$config_key" != "$config_line" ] || return 1
+        case "$config_raw" in
+            \'*\') config_value=${config_raw#\'}; config_value=${config_value%\'} ;;
+            \"*\") config_value=${config_raw#\"}; config_value=${config_value%\"} ;;
+            *) config_value=$config_raw ;;
+        esac
+        case "$config_value" in *[!0-9A-Za-z.:-]*) return 1 ;; esac
+        case "$config_seen" in *"|$config_key|"*) return 1 ;; esac
+        config_seen="${config_seen}${config_key}|"
+        case "$config_key" in
+            JOB_ID) JOB_ID=$config_value ;;
+            WG_INTERFACE) WG_INTERFACE=$config_value ;;
+            WG_SERVER_TUNNEL_IP) WG_SERVER_TUNNEL_IP=$config_value ;;
+            WG_SERVER_PUBLIC_IP) WG_SERVER_PUBLIC_IP=$config_value ;;
+            PING_COUNT) PING_COUNT=$config_value ;;
+            PING_TIMEOUT) PING_TIMEOUT=$config_value ;;
+            RESTART_DELAY) RESTART_DELAY=$config_value ;;
+            CHECK_INTERVAL) CHECK_INTERVAL=$config_value ;;
+            INTERNET_CHECK) INTERNET_CHECK=$config_value ;;
+            FAILURE_THRESHOLD) FAILURE_THRESHOLD=$config_value ;;
+            RESTART_COOLDOWN) RESTART_COOLDOWN=$config_value ;;
+            BOOT_GRACE) BOOT_GRACE=$config_value ;;
+            RECOVERY_CHECK_DELAY) RECOVERY_CHECK_DELAY=$config_value ;;
+            ENABLED) ENABLED=$config_value ;;
+            *) return 1 ;;
+        esac
+    done < "$CONFIG_FILE"
+    return 0
 }
 
 valid_job_id() {
@@ -216,9 +269,10 @@ if [ ! -r "$CONFIG_FILE" ]; then
     exit 1
 fi
 
-# Файлы создаются менеджером и доступны для записи только root.
-# shellcheck disable=SC1090
-. "$CONFIG_FILE"
+if ! load_config; then
+    log_message "[$REQUESTED_JOB] файл настроек имеет недопустимый формат"
+    exit 1
+fi
 
 : "${FAILURE_THRESHOLD:=2}"
 : "${RESTART_COOLDOWN:=30}"

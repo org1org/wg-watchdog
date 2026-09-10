@@ -278,6 +278,15 @@ fi
 assert_empty "$MOCK_DIR/ndmc.log" "ошибочная конфигурация не должна вызывать ndmc"
 pass "опасные числовые значения отклоняются"
 
+new_case
+write_config 10.0.0.1 "" 2 yes
+sed -i "s/PING_COUNT='3'/PING_COUNT='03'/" "$CONFIG_DIR/Wireguard0.conf"
+if run_watchdog healthy 12100 --force >/dev/null; then
+    fail "PING_COUNT с ведущим нулём был принят"
+fi
+assert_empty "$MOCK_DIR/ndmc.log" "неоднозначное число не должно вызывать ndmc"
+pass "watchdog отклоняет числовые параметры с ведущими нулями"
+
 # Неизвестный режим внешней проверки не должен молча менять сетевую логику.
 new_case
 write_config 10.0.0.1 "" 2 yes no
@@ -289,12 +298,68 @@ assert_contains "$MOCK_DIR/logger.log" 'недопустимый режим пр
 assert_empty "$MOCK_DIR/ndmc.log" "ошибочная настройка не должна перезапускать интерфейс"
 pass "неизвестный режим внешней проверки отклоняется"
 
+# Конфигурация читается как данные: shell-код, неизвестные ключи и дубликаты запрещены.
+new_case
+write_config 10.0.0.1 "" 2 yes no
+injection_marker="$CASE_DIR/config-code-executed"
+printf '%s\n' "RUN_CODE=\$(touch '$injection_marker')" >> "$CONFIG_DIR/Wireguard0.conf"
+if run_watchdog healthy 7200 --force >/dev/null; then
+    fail "watchdog принял shell-код в конфигурации"
+fi
+[ ! -e "$injection_marker" ] || fail "watchdog выполнил код из конфигурации"
+assert_contains "$MOCK_DIR/logger.log" 'недопустимый формат' "отказ от shell-кода"
+
+new_case
+write_config 10.0.0.1 "" 2 yes no
+printf "PING_COUNT='4'\n" >> "$CONFIG_DIR/Wireguard0.conf"
+if run_watchdog healthy 7300 --force >/dev/null; then
+    fail "watchdog принял повторяющийся ключ"
+fi
+assert_empty "$MOCK_DIR/ndmc.log" "дубликат ключа не должен запускать восстановление"
+pass "watchdog не выполняет конфигурацию и отклоняет неизвестные или повторные ключи"
+
 # Чистые функции менеджера: интервалы и cron-выражения.
 WG_WATCHDOG_LIB_ONLY=yes
 export WG_WATCHDOG_LIB_ONLY
 # shellcheck disable=SC1090
 . "$MANAGER"
 trap cleanup_tests EXIT HUP INT TERM
+
+# Менеджер использует тот же строгий формат и не исполняет содержимое файла.
+manager_bad_config="$TEST_ROOT/manager-bad.conf"
+manager_marker="$TEST_ROOT/manager-code-executed"
+cat > "$manager_bad_config" <<EOF
+JOB_ID='Wireguard0'
+WG_INTERFACE='Wireguard0'
+WG_SERVER_TUNNEL_IP='10.0.0.1'
+PING_COUNT='3'
+PING_TIMEOUT='3'
+RESTART_DELAY='3'
+CHECK_INTERVAL='5'
+INTERNET_CHECK='no'
+FAILURE_THRESHOLD='2'
+RESTART_COOLDOWN='30'
+BOOT_GRACE='180'
+RECOVERY_CHECK_DELAY='15'
+ENABLED='yes'
+RUN_CODE=\$(touch '$manager_marker')
+EOF
+if load_config "$manager_bad_config"; then fail "менеджер принял shell-код"; fi
+[ ! -e "$manager_marker" ] || fail "менеджер выполнил код из конфигурации"
+pass "менеджер читает настройки как данные, а не как shell-код"
+
+manager_valid_config="$TEST_ROOT/manager-valid.conf"
+sed '/^RUN_CODE=/d' "$manager_bad_config" > "$manager_valid_config"
+load_config "$manager_valid_config" Wireguard0 || fail "валидная конфигурация не прочитана"
+if load_config "$manager_valid_config" Wireguard1; then
+    fail "менеджер принял несовпадение имени файла и JOB_ID"
+fi
+pass "менеджер проверяет совпадение имени файла, JOB_ID и интерфейса"
+
+if is_positive_integer 01; then fail "число с ведущим нулём принято"; fi
+is_positive_integer 10 || fail "обычное положительное число отклонено"
+pass "числовые параметры имеют однозначный десятичный формат"
+
 valid_interval 5 || fail "интервал 5 отклонён"
 valid_interval 60 || fail "интервал 60 отклонён"
 if valid_interval 7; then fail "неточный интервал 7 принят"; fi
@@ -579,7 +644,7 @@ pass "версии исполняемых файлов совпадают, ст�
 version_is_newer 1.10.0 1.9.9 || fail "1.10.0 не распознана как новая версия"
 if version_is_newer 1.2.9 1.3.0; then fail "старая версия распознана как новая"; fi
 cat > "$TEST_ROOT/remote-release" <<'EOF'
-VERSION=1.8.0
+VERSION=1.9.0
 COMMIT=0123456789abcdef0123456789abcdef01234567
 WATCHDOG_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 MANAGER_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -588,7 +653,7 @@ RELEASE_MANIFEST_URL="$TEST_ROOT/remote-release"
 download_file() { cp "$1" "$2"; }
 check_update_status
 assert_equal "$UPDATE_AVAILABLE" yes "доступность обновления"
-assert_equal "$REMOTE_VERSION" 1.8.0 "номер удалённой версии"
+assert_equal "$REMOTE_VERSION" 1.9.0 "номер удалённой версии"
 assert_equal "$REMOTE_COMMIT" 0123456789abcdef0123456789abcdef01234567 "commit выпуска"
 printf 'EXTRA=value\n' >> "$TEST_ROOT/remote-release"
 check_update_status
@@ -822,7 +887,7 @@ chmod 755 "$INSTALL_MOCK_BIN/id" "$INSTALL_MOCK_BIN/wget"
 watchdog_release_hash=$(sha256sum "$WATCHDOG" | awk '{ print $1 }')
 manager_release_hash=$(sha256sum "$MANAGER" | awk '{ print $1 }')
 cat > "$INSTALL_ROOT/RELEASE" <<EOF
-VERSION=1.7.0
+VERSION=1.8.0
 COMMIT=0123456789abcdef0123456789abcdef01234567
 WATCHDOG_SHA256=$watchdog_release_hash
 MANAGER_SHA256=$manager_release_hash
@@ -847,7 +912,7 @@ installer_env() {
 }
 installer_env > "$INSTALL_ROOT/first-output"
 assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.7.0 установлен.' "summary установки"
+assert_contains "$INSTALL_ROOT/first-output" 'WG Watchdog 1.8.0 установлен.' "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -870,9 +935,9 @@ pass "повторная установочная команда только з
 
 : > "$INSTALL_ROOT/prompt"
 installer_env --force > "$INSTALL_ROOT/force-output"
-assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.7.0"' "принудительная переустановка менеджера"
+assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" 'VERSION="1.8.0"' "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.7.0 установлен.' "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" 'WG Watchdog 1.8.0 установлен.' "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.

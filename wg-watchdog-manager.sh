@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -319,7 +319,7 @@ confirm_yes() {
 
 is_positive_integer() {
     case "$1" in
-        ''|*[!0-9]*|0) return 1 ;;
+        ''|*[!0-9]*|0|0[0-9]*) return 1 ;;
         *) return 0 ;;
     esac
 }
@@ -896,8 +896,7 @@ EOF
     return 0
 }
 
-load_config() {
-    config_file=$1
+reset_config_values() {
     JOB_ID=""
     WG_INTERFACE=""
     WG_SERVER_TUNNEL_IP=""
@@ -912,8 +911,53 @@ load_config() {
     BOOT_GRACE=""
     RECOVERY_CHECK_DELAY=""
     ENABLED=""
-    # shellcheck disable=SC1090
-    . "$config_file"
+}
+
+load_config() {
+    config_file=$1
+    expected_job=${2:-}
+    reset_config_values
+    [ -r "$config_file" ] || return 1
+    config_seen="|"
+    while IFS= read -r config_line || [ -n "$config_line" ]; do
+        case "$config_line" in
+            ''|\#*) continue ;;
+        esac
+        config_key=${config_line%%=*}
+        config_raw=${config_line#*=}
+        [ "$config_key" != "$config_line" ] || return 1
+        case "$config_raw" in
+            \'*\') config_value=${config_raw#\'}; config_value=${config_value%\'} ;;
+            \"*\") config_value=${config_raw#\"}; config_value=${config_value%\"} ;;
+            *) config_value=$config_raw ;;
+        esac
+        case "$config_value" in *[!0-9A-Za-z.:-]*) return 1 ;; esac
+        case "$config_seen" in *"|$config_key|"*) return 1 ;; esac
+        config_seen="${config_seen}${config_key}|"
+        case "$config_key" in
+            JOB_ID) JOB_ID=$config_value ;;
+            WG_INTERFACE) WG_INTERFACE=$config_value ;;
+            WG_SERVER_TUNNEL_IP) WG_SERVER_TUNNEL_IP=$config_value ;;
+            WG_SERVER_PUBLIC_IP) WG_SERVER_PUBLIC_IP=$config_value ;;
+            PING_COUNT) PING_COUNT=$config_value ;;
+            PING_TIMEOUT) PING_TIMEOUT=$config_value ;;
+            RESTART_DELAY) RESTART_DELAY=$config_value ;;
+            CHECK_INTERVAL) CHECK_INTERVAL=$config_value ;;
+            INTERNET_CHECK) INTERNET_CHECK=$config_value ;;
+            FAILURE_THRESHOLD) FAILURE_THRESHOLD=$config_value ;;
+            RESTART_COOLDOWN) RESTART_COOLDOWN=$config_value ;;
+            BOOT_GRACE) BOOT_GRACE=$config_value ;;
+            RECOVERY_CHECK_DELAY) RECOVERY_CHECK_DELAY=$config_value ;;
+            ENABLED) ENABLED=$config_value ;;
+            *) return 1 ;;
+        esac
+    done < "$config_file"
+    if [ -n "$expected_job" ] && {
+        [ "$JOB_ID" != "$expected_job" ] || [ "$WG_INTERFACE" != "$expected_job" ];
+    }; then
+        return 1
+    fi
+    return 0
 }
 
 write_config() {
@@ -982,7 +1026,12 @@ rewrite_crontab() (
     printf '%s\n' "$CRON_BEGIN" >> "$new_file"
     for config_file in "$CONFIG_DIR"/*.conf; do
         [ -f "$config_file" ] || continue
-        load_config "$config_file"
+        config_name=${config_file##*/}
+        expected_job=${config_name%.conf}
+        load_config "$config_file" "$expected_job" || {
+            say "Предупреждение: пропущен повреждённый файл ${config_file##*/}."
+            continue
+        }
         if [ "$ENABLED" = "yes" ] && valid_interface "$JOB_ID" && \
            valid_interval "$CHECK_INTERVAL"; then
             cron_schedule "$CHECK_INTERVAL"
@@ -1028,13 +1077,13 @@ migrate_legacy_config() {
     existing_count=$(find "$CONFIG_DIR" -type f -name '*.conf' 2>/dev/null | wc -l)
     [ "$existing_count" -eq 0 ] || return 0
 
-    WG_INTERFACE=""
-    WG_SERVER_TUNNEL_IP=""
-    PING_COUNT="3"
-    PING_TIMEOUT="3"
-    RESTART_DELAY="3"
-    # shellcheck disable=SC1090
-    . "$LEGACY_CONFIG"
+    if ! load_config "$LEGACY_CONFIG"; then
+        say "Предупреждение: старая конфигурация имеет недопустимый формат."
+        return 0
+    fi
+    PING_COUNT=${PING_COUNT:-3}
+    PING_TIMEOUT=${PING_TIMEOUT:-3}
+    RESTART_DELAY=${RESTART_DELAY:-3}
     is_positive_integer "$PING_COUNT" || PING_COUNT=3
     is_positive_integer "$PING_TIMEOUT" || PING_TIMEOUT=3
     is_positive_integer "$RESTART_DELAY" || RESTART_DELAY=3
@@ -1059,7 +1108,12 @@ migrate_legacy_config() {
 upgrade_config_files() {
     for config_file in "$CONFIG_DIR"/*.conf; do
         [ -f "$config_file" ] || continue
-        load_config "$config_file"
+        config_name=${config_file##*/}
+        expected_job=${config_name%.conf}
+        load_config "$config_file" "$expected_job" || {
+            say "Предупреждение: файл ${config_file##*/} повреждён и не изменён."
+            continue
+        }
         valid_interface "$JOB_ID" || continue
         [ "$WG_INTERFACE" = "$JOB_ID" ] || continue
         valid_address "$WG_SERVER_TUNNEL_IP" || continue
@@ -1091,7 +1145,10 @@ configure_job() {
     original_job=${2:-}
 
     if [ "$mode" = "edit" ]; then
-        load_config "$CONFIG_DIR/$original_job.conf"
+        load_config "$CONFIG_DIR/$original_job.conf" "$original_job" || {
+            say "Ошибка: настройки $original_job повреждены; изменение отменено."
+            return 1
+        }
         old_interface=$WG_INTERFACE
         default_server=$WG_SERVER_TUNNEL_IP
         default_ping_count=$PING_COUNT
@@ -1285,7 +1342,9 @@ build_job_index() {
     count=0
     for config_file in "$CONFIG_DIR"/*.conf; do
         [ -f "$config_file" ] || continue
-        load_config "$config_file"
+        config_name=${config_file##*/}
+        expected_job=${config_name%.conf}
+        load_config "$config_file" "$expected_job" || continue
         valid_interface "$JOB_ID" || continue
         count=$((count + 1))
         printf '%s\n' "$JOB_ID" >> "$JOB_INDEX"
@@ -1335,7 +1394,10 @@ select_job() {
 toggle_job() {
     select_job "Выберите задание" || return
     config_file="$CONFIG_DIR/$SELECTED_JOB.conf"
-    load_config "$config_file"
+    load_config "$config_file" "$SELECTED_JOB" || {
+        say "Ошибка: настройки $SELECTED_JOB повреждены."
+        return 1
+    }
     if [ "$ENABLED" = "yes" ]; then
         ENABLED=no
         action="выключено"
@@ -1352,7 +1414,11 @@ delete_job() {
     select_job "Какое задание удалить" || return
     confirm "Удалить задание $SELECTED_JOB и его настройки?" || return 0
     begin_maintenance || return 0
-    load_config "$CONFIG_DIR/$SELECTED_JOB.conf"
+    load_config "$CONFIG_DIR/$SELECTED_JOB.conf" "$SELECTED_JOB" || {
+        end_maintenance
+        say "Ошибка: настройки $SELECTED_JOB повреждены; удаление отменено."
+        return 1
+    }
     ENABLED=no
     write_config
     rewrite_crontab || die "задание отключено, но cron не обновлён"
@@ -1363,7 +1429,10 @@ delete_job() {
 
 show_job_status() {
     select_job "Какое задание показать" || return
-    load_config "$CONFIG_DIR/$SELECTED_JOB.conf"
+    load_config "$CONFIG_DIR/$SELECTED_JOB.conf" "$SELECTED_JOB" || {
+        say "Ошибка: настройки $SELECTED_JOB повреждены."
+        return 1
+    }
     state_file="$STATE_DIR/$SELECTED_JOB.state"
     CONSECUTIVE_FAILURES=0
     LAST_CHECK_TEXT="никогда"
@@ -1518,7 +1587,12 @@ show_detected_interfaces() {
         interface_line="  $iface — $description"
         interface_config="$CONFIG_DIR/$iface.conf"
         if [ -f "$interface_config" ]; then
-            load_config "$interface_config"
+            if ! load_config "$interface_config" "$iface"; then
+                interface_color=$COLOR_RED
+                interface_line="$interface_line — настройки повреждены"
+                say "${interface_color}${interface_line}${COLOR_RESET}"
+                continue
+            fi
             if [ "$JOB_ID" = "$iface" ] && [ "$WG_INTERFACE" = "$iface" ]; then
                 if [ "$ENABLED" = yes ]; then
                     interface_color=$COLOR_GREEN
