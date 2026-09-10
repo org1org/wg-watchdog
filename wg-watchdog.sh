@@ -295,7 +295,6 @@ fi
 is_integer_between "$PING_COUNT" 1 10 && \
 is_integer_between "$PING_TIMEOUT" 1 30 && \
 is_integer_between "$RESTART_DELAY" 1 60 && \
-is_integer_between "$CHECK_INTERVAL" 1 60 && \
 is_integer_between "$FAILURE_THRESHOLD" 1 10 && \
 is_integer_between "$RESTART_COOLDOWN" 1 1440 && \
 is_integer_between "$BOOT_GRACE" 1 3600 && \
@@ -303,6 +302,10 @@ is_integer_between "$RECOVERY_CHECK_DELAY" 1 300 || {
     log_message "[$JOB_ID] в настройках найдено недопустимое числовое значение"
     exit 1
 }
+case "$CHECK_INTERVAL" in
+    1|2|3|4|5|6|10|12|15|20|30|60) ;;
+    *) log_message "[$JOB_ID] в настройках найден недопустимый интервал проверки"; exit 1 ;;
+esac
 case "$INTERNET_CHECK" in
     yes|no) ;;
     *) log_message "[$JOB_ID] в настройках найден недопустимый режим проверки интернета"; exit 1 ;;

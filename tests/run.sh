@@ -287,6 +287,16 @@ fi
 assert_empty "$MOCK_DIR/ndmc.log" "неоднозначное число не должно вызывать ndmc"
 pass "watchdog отклоняет числовые параметры с ведущими нулями"
 
+new_case
+write_config 10.0.0.1 "" 2 yes no
+sed -i "s/CHECK_INTERVAL='5'/CHECK_INTERVAL='7'/" "$CONFIG_DIR/Wireguard0.conf"
+if run_watchdog healthy 12150 --force >/dev/null; then
+    fail "неточный CHECK_INTERVAL был принят watchdog"
+fi
+assert_contains "$MOCK_DIR/logger.log" 'недопустимый интервал проверки' "валидация CHECK_INTERVAL"
+assert_empty "$MOCK_DIR/ndmc.log" "неточный интервал не должен вызывать ndmc"
+pass "watchdog принимает только интервалы, которые точно представляет cron"
+
 # Неизвестный режим внешней проверки не должен молча менять сетевую логику.
 new_case
 write_config 10.0.0.1 "" 2 yes no
@@ -359,6 +369,26 @@ pass "менеджер проверяет совпадение имени фай
 if is_positive_integer 01; then fail "число с ведущим нулём принято"; fi
 is_positive_integer 10 || fail "обычное положительное число отклонено"
 pass "числовые параметры имеют однозначный десятичный формат"
+
+# Одна схема определяет все числовые параметры менеджера.
+assert_equal "$NUMERIC_PARAMETERS" \
+    "PING_COUNT PING_TIMEOUT RESTART_DELAY CHECK_INTERVAL FAILURE_THRESHOLD RESTART_COOLDOWN BOOT_GRACE RECOVERY_CHECK_DELAY" \
+    "полнота схемы параметров"
+parameter_spec PING_COUNT
+assert_equal "$SPEC_DEFAULT:$SPEC_MIN:$SPEC_MAX" "3:1:10" "схема PING_COUNT"
+assert_equal "$SPEC_DESCRIPTION" "число ping-запросов при проверке" "описание PING_COUNT"
+parameter_spec CHECK_INTERVAL
+assert_equal "$SPEC_DEFAULT:$SPEC_MIN:$SPEC_MAX" "5:1:60" "схема CHECK_INTERVAL"
+assert_equal "$SPEC_ALLOWED" "1 2 3 4 5 6 10 12 15 20 30 60" "точные интервалы cron"
+apply_default_parameters
+assert_equal "$PING_COUNT:$PING_TIMEOUT:$RESTART_DELAY:$CHECK_INTERVAL" "3:3:3:5" "основные значения по умолчанию"
+assert_equal "$FAILURE_THRESHOLD:$RESTART_COOLDOWN:$BOOT_GRACE:$RECOVERY_CHECK_DELAY" \
+    "2:30:180:15" "защитные значения по умолчанию"
+valid_parameter_value RESTART_COOLDOWN 1440 || fail "верхняя граница cooldown отклонена"
+if valid_parameter_value RESTART_COOLDOWN 1441; then fail "превышение cooldown принято"; fi
+if valid_parameter_value PING_COUNT 03; then fail "ведущий ноль принят схемой"; fi
+if parameter_spec UNKNOWN_PARAMETER; then fail "неизвестный параметр принят схемой"; fi
+pass "единая схема задаёт имена, значения, границы и описания"
 
 valid_interval 5 || fail "интервал 5 отклонён"
 valid_interval 60 || fail "интервал 60 отклонён"
@@ -592,6 +622,25 @@ COLOR_GREEN=''
 COLOR_RED=''
 COLOR_RESET=''
 pass "состояния заданий различаются цветом и нумеруются с точкой"
+
+# Итоги действий имеют один компактный формат для успеха, ошибки и отмены.
+COLOR_GREEN='<GREEN>'
+COLOR_RED='<RED>'
+COLOR_GRAY='<GRAY>'
+COLOR_RESET='</COLOR>'
+result_card success "Задание сохранено." "Cron обновлён." "Вернитесь в меню." > "$MANAGER_ROOT/result-card"
+assert_contains "$MANAGER_ROOT/result-card" '<GREEN>ГОТОВО: Задание сохранено.</COLOR>' "карточка успеха"
+assert_contains "$MANAGER_ROOT/result-card" '  Cron обновлён.' "детали результата"
+assert_contains "$MANAGER_ROOT/result-card" '  Далее: Вернитесь в меню.' "следующее действие"
+result_card error "Проверка не выполнена." > "$MANAGER_ROOT/result-error"
+assert_contains "$MANAGER_ROOT/result-error" '<RED>ОШИБКА: Проверка не выполнена.</COLOR>' "карточка ошибки"
+result_card cancelled "Изменений нет." > "$MANAGER_ROOT/result-cancelled"
+assert_contains "$MANAGER_ROOT/result-cancelled" '<GRAY>ОТМЕНЕНО: Изменений нет.</COLOR>' "карточка отмены"
+COLOR_GREEN=''
+COLOR_RED=''
+COLOR_GRAY=''
+COLOR_RESET=''
+pass "результаты действий используют единые карточки"
 
 # Каждый пункт, работающий с заданием, показывает список без выбора по Enter и позволяет вернуться.
 ACTION_ROOT="$TEST_ROOT/job-actions"

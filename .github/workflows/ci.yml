@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test shells and ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
+
+      - name: Check POSIX shell syntax
+        run: |
+          sh -n install.sh wg-watchdog-manager.sh wg-watchdog.sh tests/run.sh
+          dash -n install.sh wg-watchdog-manager.sh wg-watchdog.sh tests/run.sh
+          busybox ash -n install.sh
+          busybox ash -n wg-watchdog-manager.sh
+          busybox ash -n wg-watchdog.sh
+          busybox ash -n tests/run.sh
+
+      - name: Run static analysis
+        run: shellcheck --shell=sh --severity=error install.sh wg-watchdog-manager.sh wg-watchdog.sh tests/run.sh
+
+      - name: Run functional tests with sh
+        run: sh tests/run.sh
+
+      - name: Run functional tests with dash
+        run: dash tests/run.sh
+
+      - name: Run functional tests with BusyBox ash
+        run: busybox ash tests/run.sh
+
+      - name: Run terminal tests
+        run: python3 tests/terminal.py

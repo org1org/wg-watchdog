@@ -182,6 +182,25 @@ say() {
     if [ "$UI_ACTIVE" = yes ]; then ui_text "$*"; else printf '%s\n' "$*"; fi
 }
 info() { say "${COLOR_GREEN}$*${COLOR_RESET}"; }
+
+result_card() {
+    result_kind=$1
+    result_title=$2
+    result_detail=${3:-}
+    result_next=${4:-}
+    case "$result_kind" in
+        success) result_label="ГОТОВО"; result_color=$COLOR_GREEN ;;
+        warning) result_label="ВНИМАНИЕ"; result_color=$COLOR_YELLOW ;;
+        error) result_label="ОШИБКА"; result_color=$COLOR_RED ;;
+        cancelled) result_label="ОТМЕНЕНО"; result_color=$COLOR_GRAY ;;
+        *) return 1 ;;
+    esac
+    say ""
+    say "${result_color}${result_label}: $result_title${COLOR_RESET}"
+    [ -z "$result_detail" ] || say "  $result_detail"
+    [ -z "$result_next" ] || say "  Далее: $result_next"
+}
+
 die() { ui_stop; printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
 
 open_console() {
@@ -342,39 +361,107 @@ valid_address() {
     esac
 }
 
-ask_integer_range() {
-    variable_name=$1
-    prompt=$2
-    default_value=$3
-    minimum=$4
-    maximum=$5
-    while :; do
-        read_answer "$prompt ($minimum–$maximum)" "$default_value"
-        if is_positive_integer "$REPLY" && [ "$REPLY" -ge "$minimum" ] && \
-           [ "$REPLY" -le "$maximum" ]; then
-            eval "$variable_name=\$REPLY"
-            return 0
-        fi
-        say "Введите целое число от $minimum до $maximum."
+NUMERIC_PARAMETERS="PING_COUNT PING_TIMEOUT RESTART_DELAY CHECK_INTERVAL FAILURE_THRESHOLD RESTART_COOLDOWN BOOT_GRACE RECOVERY_CHECK_DELAY"
+
+parameter_spec() {
+    SPEC_ALLOWED=""
+    case "$1" in
+        PING_COUNT) SPEC_DEFAULT=3; SPEC_MIN=1; SPEC_MAX=10; SPEC_DESCRIPTION="число ping-запросов при проверке" ;;
+        PING_TIMEOUT) SPEC_DEFAULT=3; SPEC_MIN=1; SPEC_MAX=30; SPEC_DESCRIPTION="ожидание каждого ответа, секунд" ;;
+        RESTART_DELAY) SPEC_DEFAULT=3; SPEC_MIN=1; SPEC_MAX=60; SPEC_DESCRIPTION="пауза down/up интерфейса, секунд" ;;
+        CHECK_INTERVAL) SPEC_DEFAULT=5; SPEC_MIN=1; SPEC_MAX=60; SPEC_ALLOWED="1 2 3 4 5 6 10 12 15 20 30 60"; SPEC_DESCRIPTION="частота проверки в минутах" ;;
+        FAILURE_THRESHOLD) SPEC_DEFAULT=2; SPEC_MIN=1; SPEC_MAX=10; SPEC_DESCRIPTION="неудачных проверок до перезапуска" ;;
+        RESTART_COOLDOWN) SPEC_DEFAULT=30; SPEC_MIN=1; SPEC_MAX=1440; SPEC_DESCRIPTION="пауза между перезапусками, минут" ;;
+        BOOT_GRACE) SPEC_DEFAULT=180; SPEC_MIN=1; SPEC_MAX=3600; SPEC_DESCRIPTION="ожидание после загрузки роутера, секунд" ;;
+        RECOVERY_CHECK_DELAY) SPEC_DEFAULT=15; SPEC_MIN=1; SPEC_MAX=300; SPEC_DESCRIPTION="ожидание проверки после перезапуска, секунд" ;;
+        *) return 1 ;;
+    esac
+}
+
+get_parameter_value() {
+    case "$1" in
+        PING_COUNT) REPLY=$PING_COUNT ;;
+        PING_TIMEOUT) REPLY=$PING_TIMEOUT ;;
+        RESTART_DELAY) REPLY=$RESTART_DELAY ;;
+        CHECK_INTERVAL) REPLY=$CHECK_INTERVAL ;;
+        FAILURE_THRESHOLD) REPLY=$FAILURE_THRESHOLD ;;
+        RESTART_COOLDOWN) REPLY=$RESTART_COOLDOWN ;;
+        BOOT_GRACE) REPLY=$BOOT_GRACE ;;
+        RECOVERY_CHECK_DELAY) REPLY=$RECOVERY_CHECK_DELAY ;;
+        *) return 1 ;;
+    esac
+}
+
+set_parameter_value() {
+    case "$1" in
+        PING_COUNT) PING_COUNT=$2 ;;
+        PING_TIMEOUT) PING_TIMEOUT=$2 ;;
+        RESTART_DELAY) RESTART_DELAY=$2 ;;
+        CHECK_INTERVAL) CHECK_INTERVAL=$2 ;;
+        FAILURE_THRESHOLD) FAILURE_THRESHOLD=$2 ;;
+        RESTART_COOLDOWN) RESTART_COOLDOWN=$2 ;;
+        BOOT_GRACE) BOOT_GRACE=$2 ;;
+        RECOVERY_CHECK_DELAY) RECOVERY_CHECK_DELAY=$2 ;;
+        *) return 1 ;;
+    esac
+}
+
+valid_parameter_value() {
+    parameter_spec "$1" || return 1
+    is_positive_integer "$2" || return 1
+    if [ -n "$SPEC_ALLOWED" ]; then
+        case " $SPEC_ALLOWED " in *" $2 "*) return 0 ;; *) return 1 ;; esac
+    fi
+    [ "$2" -ge "$SPEC_MIN" ] && [ "$2" -le "$SPEC_MAX" ]
+}
+
+apply_default_parameters() {
+    for parameter_name in $NUMERIC_PARAMETERS; do
+        parameter_spec "$parameter_name" || return 1
+        set_parameter_value "$parameter_name" "$SPEC_DEFAULT" || return 1
     done
 }
 
-ask_interval() {
+normalize_parameters() {
+    normalization_job=${1:-}
+    for parameter_name in $NUMERIC_PARAMETERS; do
+        get_parameter_value "$parameter_name" || return 1
+        parameter_value=$REPLY
+        if ! valid_parameter_value "$parameter_name" "$parameter_value"; then
+            parameter_spec "$parameter_name" || return 1
+            set_parameter_value "$parameter_name" "$SPEC_DEFAULT" || return 1
+            if [ -n "$normalization_job" ]; then
+                say "Параметр $parameter_name задания $normalization_job заменён на $SPEC_DEFAULT."
+            fi
+        fi
+    done
+}
+
+ask_parameter() {
+    parameter_name=$1
+    current_value=$2
+    parameter_spec "$parameter_name" || return 1
+    if [ -n "$SPEC_ALLOWED" ]; then
+        parameter_limits=$SPEC_ALLOWED
+    else
+        parameter_limits="$SPEC_MIN–$SPEC_MAX"
+    fi
     while :; do
-        read_answer "CHECK_INTERVAL — частота проверки в минутах (1,2,3,4,5,6,10,12,15,20,30,60)" "$1"
-        if valid_interval "$REPLY"; then
-            CHECK_INTERVAL=$REPLY
+        read_answer "$parameter_name — $SPEC_DESCRIPTION ($parameter_limits)" "$current_value"
+        if valid_parameter_value "$parameter_name" "$REPLY"; then
+            set_parameter_value "$parameter_name" "$REPLY"
             return 0
         fi
-        say "Допустимые значения: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30 или 60."
+        if [ -n "$SPEC_ALLOWED" ]; then
+            say "Допустимые значения: $SPEC_ALLOWED."
+        else
+            say "Введите целое число от $SPEC_MIN до $SPEC_MAX без ведущих нулей."
+        fi
     done
 }
 
 valid_interval() {
-    case "$1" in
-        1|2|3|4|5|6|10|12|15|20|30|60) return 0 ;;
-        *) return 1 ;;
-    esac
+    valid_parameter_value CHECK_INTERVAL "$1"
 }
 
 cron_schedule() {
@@ -714,17 +801,24 @@ perform_update() {
     info "Проверяю наличие новой версии..."
     check_update_status
     if [ "$UPDATE_AVAILABLE" = "unknown" ]; then
-        say "Не удалось получить сведения об обновлениях. Проверьте доступ в интернет."
+        result_card warning "Не удалось проверить обновления." \
+            "Локальное управление продолжает работать." \
+            "Проверьте доступ в интернет и повторите попытку."
         return 0
     fi
     if [ "$UPDATE_AVAILABLE" = "no" ]; then
-        info "Установлена актуальная версия $VERSION."
+        result_card success "Установлена актуальная версия $VERSION."
         return 0
     fi
     say "Доступна версия $REMOTE_VERSION; установлена версия $VERSION."
-    confirm "Загрузить и установить обновление?" || return 0
+    confirm "Загрузить и установить обновление?" || {
+        result_card cancelled "Обновление не выполнялось."
+        return 0
+    }
     if ! install_program_files; then
-        say "Обновление не установлено; предыдущая версия сохранена или восстановлена."
+        result_card error "Обновление не установлено." \
+            "Предыдущая версия сохранена или восстановлена." \
+            "Проверьте сообщения выше и повторите попытку."
         return 0
     fi
     info "Обновление установлено. Перезапускаю менеджер..."
@@ -1081,21 +1175,11 @@ migrate_legacy_config() {
         say "Предупреждение: старая конфигурация имеет недопустимый формат."
         return 0
     fi
-    PING_COUNT=${PING_COUNT:-3}
-    PING_TIMEOUT=${PING_TIMEOUT:-3}
-    RESTART_DELAY=${RESTART_DELAY:-3}
-    is_positive_integer "$PING_COUNT" || PING_COUNT=3
-    is_positive_integer "$PING_TIMEOUT" || PING_TIMEOUT=3
-    is_positive_integer "$RESTART_DELAY" || RESTART_DELAY=3
+    normalize_parameters "" || die "внутренняя ошибка схемы параметров"
     if valid_interface "$WG_INTERFACE" && valid_address "$WG_SERVER_TUNNEL_IP"; then
         JOB_ID=$WG_INTERFACE
-        CHECK_INTERVAL=5
         INTERNET_CHECK=yes
         WG_SERVER_PUBLIC_IP=""
-        FAILURE_THRESHOLD=2
-        RESTART_COOLDOWN=30
-        BOOT_GRACE=180
-        RECOVERY_CHECK_DELAY=15
         ENABLED=yes
         write_config
         mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.migrated-v1.0.0"
@@ -1117,24 +1201,10 @@ upgrade_config_files() {
         valid_interface "$JOB_ID" || continue
         [ "$WG_INTERFACE" = "$JOB_ID" ] || continue
         valid_address "$WG_SERVER_TUNNEL_IP" || continue
-        is_positive_integer "$PING_COUNT" && [ "$PING_COUNT" -le 10 ] || PING_COUNT=3
-        is_positive_integer "$PING_TIMEOUT" && [ "$PING_TIMEOUT" -le 30 ] || PING_TIMEOUT=3
-        is_positive_integer "$RESTART_DELAY" && [ "$RESTART_DELAY" -le 60 ] || RESTART_DELAY=3
-        if ! valid_interval "$CHECK_INTERVAL"; then
-            say "Интервал задания $JOB_ID заменён на точные 5 минут."
-            CHECK_INTERVAL=5
-        fi
-        FAILURE_THRESHOLD=${FAILURE_THRESHOLD:-2}
-        RESTART_COOLDOWN=${RESTART_COOLDOWN:-30}
-        BOOT_GRACE=${BOOT_GRACE:-180}
-        RECOVERY_CHECK_DELAY=${RECOVERY_CHECK_DELAY:-15}
+        normalize_parameters "$JOB_ID" || die "внутренняя ошибка схемы параметров"
         WG_SERVER_PUBLIC_IP=${WG_SERVER_PUBLIC_IP:-}
         # Jobs created before v1.7.0 keep their former external-network gate.
         case "${INTERNET_CHECK:-}" in yes|no) ;; *) INTERNET_CHECK=yes ;; esac
-        is_positive_integer "$FAILURE_THRESHOLD" && [ "$FAILURE_THRESHOLD" -le 10 ] || FAILURE_THRESHOLD=2
-        is_positive_integer "$RESTART_COOLDOWN" && [ "$RESTART_COOLDOWN" -le 1440 ] || RESTART_COOLDOWN=30
-        is_positive_integer "$BOOT_GRACE" && [ "$BOOT_GRACE" -le 3600 ] || BOOT_GRACE=180
-        is_positive_integer "$RECOVERY_CHECK_DELAY" && [ "$RECOVERY_CHECK_DELAY" -le 300 ] || RECOVERY_CHECK_DELAY=15
         [ "$ENABLED" = "yes" ] || ENABLED=no
         write_config
     done
@@ -1146,35 +1216,21 @@ configure_job() {
 
     if [ "$mode" = "edit" ]; then
         load_config "$CONFIG_DIR/$original_job.conf" "$original_job" || {
-            say "Ошибка: настройки $original_job повреждены; изменение отменено."
+            result_card error "Настройки $original_job повреждены; изменение отменено." \
+                "Файл задания не соответствует безопасному формату."
             return 1
         }
         old_interface=$WG_INTERFACE
         default_server=$WG_SERVER_TUNNEL_IP
-        default_ping_count=$PING_COUNT
-        default_ping_timeout=$PING_TIMEOUT
-        default_restart_delay=$RESTART_DELAY
-        default_interval=$CHECK_INTERVAL
         default_internet_check=${INTERNET_CHECK:-yes}
         default_public_ip=${WG_SERVER_PUBLIC_IP:-}
-        default_failure_threshold=${FAILURE_THRESHOLD:-2}
-        default_restart_cooldown=${RESTART_COOLDOWN:-30}
-        default_boot_grace=${BOOT_GRACE:-180}
-        default_recovery_delay=${RECOVERY_CHECK_DELAY:-15}
         old_enabled=$ENABLED
     else
         old_interface=""
         default_server=""
-        default_ping_count=3
-        default_ping_timeout=3
-        default_restart_delay=3
-        default_interval=5
+        apply_default_parameters || die "внутренняя ошибка схемы параметров"
         default_internet_check=no
         default_public_ip=""
-        default_failure_threshold=2
-        default_restart_cooldown=30
-        default_boot_grace=180
-        default_recovery_delay=15
         old_enabled=yes
     fi
 
@@ -1188,7 +1244,9 @@ configure_job() {
     fi
     JOB_ID=$WG_INTERFACE
     if [ -f "$CONFIG_DIR/$JOB_ID.conf" ] && [ "$JOB_ID" != "$original_job" ]; then
-        say "Для $JOB_ID уже существует задание. Используйте пункт «Изменить»."
+        result_card warning "Для $JOB_ID уже существует задание." \
+            "Новое задание не создано." \
+            "Используйте пункт «Изменить задание»."
         return 1
     fi
 
@@ -1228,7 +1286,10 @@ configure_job() {
         say "Сервер отвечает на ping."
     else
         say "Сервер не ответил. Возможно, туннель сейчас не работает или ICMP запрещён."
-        confirm "Продолжить настройку?" || return 1
+        confirm "Продолжить настройку?" || {
+            result_card cancelled "Настройка задания не сохранена."
+            return 1
+        }
     fi
 
     say ""
@@ -1291,25 +1352,14 @@ configure_job() {
         INTERNET_CHECK=$default_internet_check
     fi
 
-    if [ "$mode" = "add" ]; then
-        PING_COUNT=$default_ping_count
-        PING_TIMEOUT=$default_ping_timeout
-        RESTART_DELAY=$default_restart_delay
-        CHECK_INTERVAL=$default_interval
-        FAILURE_THRESHOLD=$default_failure_threshold
-        RESTART_COOLDOWN=$default_restart_cooldown
-        BOOT_GRACE=$default_boot_grace
-        RECOVERY_CHECK_DELAY=$default_recovery_delay
-    else
+    if [ "$mode" = "edit" ]; then
         say "Нажмите Enter, чтобы принять значение в скобках."
-        ask_integer_range PING_COUNT "PING_COUNT — число ping-запросов при проверке" "$default_ping_count" 1 10
-        ask_integer_range PING_TIMEOUT "PING_TIMEOUT — ожидание каждого ответа, секунд" "$default_ping_timeout" 1 30
-        ask_integer_range RESTART_DELAY "RESTART_DELAY — пауза down/up интерфейса, секунд" "$default_restart_delay" 1 60
-        ask_interval "$default_interval"
-        ask_integer_range FAILURE_THRESHOLD "FAILURE_THRESHOLD — неудачных проверок до перезапуска" "$default_failure_threshold" 1 10
-        ask_integer_range RESTART_COOLDOWN "RESTART_COOLDOWN — пауза между перезапусками, минут" "$default_restart_cooldown" 1 1440
-        ask_integer_range BOOT_GRACE "BOOT_GRACE — ожидание после загрузки роутера, секунд" "$default_boot_grace" 1 3600
-        ask_integer_range RECOVERY_CHECK_DELAY "RECOVERY_CHECK_DELAY — ожидание проверки после перезапуска, секунд" "$default_recovery_delay" 1 300
+        for parameter_name in $NUMERIC_PARAMETERS; do
+            get_parameter_value "$parameter_name" || die "внутренняя ошибка схемы параметров"
+            current_parameter_value=$REPLY
+            ask_parameter "$parameter_name" "$current_parameter_value" || \
+                die "внутренняя ошибка схемы параметров"
+        done
     fi
     ENABLED=$old_enabled
 
@@ -1322,7 +1372,7 @@ configure_job() {
     else
         saved_state="выключено"
     fi
-    info "Задание $saved_job сохранено и $saved_state."
+    result_card success "Задание $saved_job сохранено и $saved_state."
     if [ "$mode" = "add" ]; then
         say "Применены рекомендуемые параметры:"
         say "  проверка каждые $CHECK_INTERVAL мин.; $PING_COUNT ping по $PING_TIMEOUT сек.;"
@@ -1395,7 +1445,8 @@ toggle_job() {
     select_job "Выберите задание" || return
     config_file="$CONFIG_DIR/$SELECTED_JOB.conf"
     load_config "$config_file" "$SELECTED_JOB" || {
-        say "Ошибка: настройки $SELECTED_JOB повреждены."
+        result_card error "Настройки $SELECTED_JOB повреждены." \
+            "Переключение задания не выполнялось."
         return 1
     }
     if [ "$ENABLED" = "yes" ]; then
@@ -1407,16 +1458,20 @@ toggle_job() {
     fi
     write_config
     rewrite_crontab || die "не удалось обновить cron"
-    say "Задание $SELECTED_JOB $action."
+    result_card success "Задание $SELECTED_JOB $action."
 }
 
 delete_job() {
     select_job "Какое задание удалить" || return
-    confirm "Удалить задание $SELECTED_JOB и его настройки?" || return 0
+    confirm "Удалить задание $SELECTED_JOB и его настройки?" || {
+        result_card cancelled "Задание $SELECTED_JOB сохранено без изменений."
+        return 0
+    }
     begin_maintenance || return 0
     load_config "$CONFIG_DIR/$SELECTED_JOB.conf" "$SELECTED_JOB" || {
         end_maintenance
-        say "Ошибка: настройки $SELECTED_JOB повреждены; удаление отменено."
+        result_card error "Настройки $SELECTED_JOB повреждены; удаление отменено." \
+            "Файл задания оставлен без изменений."
         return 1
     }
     ENABLED=no
@@ -1424,13 +1479,14 @@ delete_job() {
     rewrite_crontab || die "задание отключено, но cron не обновлён"
     remove_job_files "$SELECTED_JOB" || die "удаление не завершено: часть файлов осталась"
     end_maintenance
-    say "Задание $SELECTED_JOB удалено."
+    result_card success "Задание $SELECTED_JOB удалено."
 }
 
 show_job_status() {
     select_job "Какое задание показать" || return
     load_config "$CONFIG_DIR/$SELECTED_JOB.conf" "$SELECTED_JOB" || {
-        say "Ошибка: настройки $SELECTED_JOB повреждены."
+        result_card error "Настройки $SELECTED_JOB повреждены." \
+            "Подробный статус недоступен."
         return 1
     }
     state_file="$STATE_DIR/$SELECTED_JOB.state"
@@ -1470,9 +1526,12 @@ run_job_now() {
     run_visible "$WATCHDOG_PATH" --job "$SELECTED_JOB" --force
     result=$?
     if [ "$result" -eq 0 ]; then
-        say "Проверка завершена. Подробности перезапусков: logread | grep wg-watchdog"
+        result_card success "Проверка $SELECTED_JOB завершена." \
+            "Подробности перезапусков: logread | grep wg-watchdog"
     else
-        say "Проверка завершилась с кодом $result. Посмотрите системный журнал."
+        result_card error "Проверка $SELECTED_JOB завершилась с кодом $result." \
+            "Watchdog сообщил об ошибке выполнения." \
+            "Посмотрите системный журнал: logread | grep wg-watchdog"
     fi
 }
 
@@ -1514,10 +1573,16 @@ uninstall_program() {
     say "Пакеты Entware cron и ndmq останутся: они могут использоваться другими программами."
     if [ "$uninstall_mode" = keep ]; then
         say "Конфигурации останутся в $CONFIG_DIR и будут подхвачены после переустановки."
-        confirm "Удалить программу и сохранить задания?" || return 0
+        confirm "Удалить программу и сохранить задания?" || {
+            result_card cancelled "WG Watchdog и задания сохранены без изменений."
+            return 0
+        }
     else
         say "Настройки заданий и их состояние будут удалены без возможности восстановления."
-        confirm "Удалить программу и все задания?" || return 0
+        confirm "Удалить программу и все задания?" || {
+            result_card cancelled "WG Watchdog и задания сохранены без изменений."
+            return 0
+        }
     fi
     begin_maintenance || return 0
     remove_managed_cron
