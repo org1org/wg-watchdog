@@ -1376,27 +1376,29 @@ configure_job() {
         INTERNET_CHECK=$default_internet_check
     fi
 
-    say ""
-    say "Контрольные адреса используются только при включённой проверке обычного интернета."
-    say "Можно указать IP-адреса или DNS-имена; ответ любого из двух считается успешным."
     INTERNET_CHECK_TARGET_1=$default_internet_target_1
     INTERNET_CHECK_TARGET_2=$default_internet_target_2
-    while :; do
-        read_answer "Контрольный адрес 1 (IP или DNS-имя)" "$default_internet_target_1"
-        if valid_address "$REPLY"; then
-            INTERNET_CHECK_TARGET_1=$REPLY
-            break
-        fi
-        say "Введите IP-адрес или DNS-имя без пробелов."
-    done
-    while :; do
-        read_answer "Контрольный адрес 2 (IP или DNS-имя)" "$default_internet_target_2"
-        if valid_address "$REPLY"; then
-            INTERNET_CHECK_TARGET_2=$REPLY
-            break
-        fi
-        say "Введите IP-адрес или DNS-имя без пробелов."
-    done
+    if [ "$INTERNET_CHECK" = yes ]; then
+        say ""
+        say "Укажите два контрольных адреса обычного интернета."
+        say "Можно использовать IP-адреса или DNS-имена; ответа одного из двух достаточно."
+        while :; do
+            read_answer "Контрольный адрес 1 (IP или DNS-имя)" "$default_internet_target_1"
+            if valid_address "$REPLY"; then
+                INTERNET_CHECK_TARGET_1=$REPLY
+                break
+            fi
+            say "Введите IP-адрес или DNS-имя без пробелов."
+        done
+        while :; do
+            read_answer "Контрольный адрес 2 (IP или DNS-имя)" "$default_internet_target_2"
+            if valid_address "$REPLY"; then
+                INTERNET_CHECK_TARGET_2=$REPLY
+                break
+            fi
+            say "Введите IP-адрес или DNS-имя без пробелов."
+        done
+    fi
 
     if [ "$mode" = "edit" ]; then
         say "Нажмите Enter, чтобы принять значение в скобках."

@@ -544,7 +544,7 @@ prepare_dialog_case() {
 }
 
 prepare_dialog_case manager-default-public-off
-printf '1\n\n\n\n\n' > "$INPUT_DEVICE"
+printf '1\n\n\n' > "$INPUT_DEVICE"
 open_console
 configure_job add "" > "$DIALOG_ROOT/output"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_TUNNEL_IP='10.0.0.1'" "автоподстановка внутреннего адреса"
@@ -555,8 +555,9 @@ assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "поро�
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='no'" "безопасный режим full-tunnel"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_1='1.1.1.1'" "первый контрольный адрес по умолчанию"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_2='8.8.8.8'" "второй контрольный адрес по умолчанию"
-assert_contains "$OUTPUT_DEVICE" 'Контрольный адрес 1 (IP или DNS-имя)' "адрес при создании задания"
-assert_contains "$OUTPUT_DEVICE" 'Контрольный адрес 2 (IP или DNS-имя)' "второй адрес при создании задания"
+if grep -F 'Контрольный адрес ' "$OUTPUT_DEVICE" >/dev/null; then
+    fail "при выключенной проверке интернета запрошены контрольные адреса"
+fi
 if grep -F 'PING_COUNT —' "$OUTPUT_DEVICE" >/dev/null || \
    grep -F 'CHECK_INTERVAL —' "$OUTPUT_DEVICE" >/dev/null; then
     fail "при создании задания запрошены числовые параметры"
@@ -566,7 +567,7 @@ assert_contains "$DIALOG_ROOT/output" 'Изменить эти значения 
 pass "новое задание получает рекомендуемые параметры без лишних вопросов"
 
 # Редактирование существующего задания не спрашивает интерфейс повторно.
-printf '\n\n\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
 open_console
 configure_job edit Wireguard0 >/dev/null
 if grep -F 'Выберите номер интерфейса' "$OUTPUT_DEVICE" >/dev/null; then
@@ -588,7 +589,7 @@ pass "менеджер позволяет изменить контрольны�
 
 # Явный yes включает проверку и предлагает Endpoint в качестве адреса.
 prepare_dialog_case manager-public-opt-in
-printf '1\n\ny\n\n\n\n' > "$INPUT_DEVICE"
+printf '1\n\ny\n\n' > "$INPUT_DEVICE"
 open_console
 configure_job add "" >/dev/null
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP='198.51.100.10'" "публичный Endpoint"
@@ -1155,7 +1156,7 @@ pass "временные файлы уникальны, закрыты и кор
     TMP_FILES=""
     trap cleanup EXIT
     prepare_dialog_case cancel-delete
-    printf '1\n\n\n\n\n' > "$INPUT_DEVICE"
+    printf '1\n\n\n' > "$INPUT_DEVICE"
     open_console
     configure_job add "" >/dev/null
     printf '6\n1\nn\n0\n' > "$INPUT_DEVICE"
@@ -1173,14 +1174,14 @@ pass "отмена удаления не выводит ложное сообщ�
     TMP_FILES=""
     trap cleanup EXIT
     prepare_dialog_case edit-multi-peer
-    printf '1\n\n\n\n\n' > "$INPUT_DEVICE"
+    printf '1\n\n\n' > "$INPUT_DEVICE"
     open_console
     configure_job add "" >/dev/null
     load_config "$CONFIG_DIR/Wireguard0.conf"
     JOB_ID=Wireguard3
     WG_INTERFACE=Wireguard3
     write_config
-    printf '\n\n\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+    printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
     open_console
     configure_job edit Wireguard3 > "$DIALOG_ROOT/edit-output"
     if grep -F 'Выберите пир' "$OUTPUT_DEVICE" >/dev/null; then fail "повторный выбор пира при редактировании"; fi
