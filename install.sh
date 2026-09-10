@@ -2,7 +2,7 @@
 
 # Compact bootstrap installer for WG Watchdog.
 
-VERSION="1.8.1"
+VERSION="1.8.2"
 BASE_URL="${WG_WATCHDOG_BASE_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog/main}"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
 RELEASE_MANIFEST_URL="${WG_WATCHDOG_RELEASE_MANIFEST_URL:-$BASE_URL/RELEASE}"
@@ -15,6 +15,9 @@ TTY_DEVICE="${WG_WATCHDOG_TTY:-/dev/tty}"
 INPUT_DEVICE="${WG_WATCHDOG_INPUT:-$TTY_DEVICE}"
 OUTPUT_DEVICE="${WG_WATCHDOG_OUTPUT:-$TTY_DEVICE}"
 OPKG_BIN="${WG_WATCHDOG_OPKG:-opkg}"
+NDMC_BIN="${WG_WATCHDOG_NDMC:-ndmc}"
+CRON_INIT="${WG_WATCHDOG_CRON_INIT:-$OPT_ROOT/etc/init.d/S10cron}"
+PIDOF_BIN="${WG_WATCHDOG_PIDOF:-pidof}"
 SHA256_BIN="${WG_WATCHDOG_SHA256:-sha256sum}"
 PATH="${WG_WATCHDOG_INSTALL_PATH:-$OPT_ROOT/bin:$OPT_ROOT/sbin:/usr/sbin:/usr/bin:/sbin:/bin}"
 export PATH
@@ -138,6 +141,28 @@ ensure_short_command() {
     ln -s "$MANAGER_PATH" "$SHORT_COMMAND" || die "не удалось создать команду wgwm"
 }
 
+ensure_dependencies() {
+    missing_packages=""
+    command -v "$NDMC_BIN" >/dev/null 2>&1 || missing_packages="ndmq"
+    [ -x "$CRON_INIT" ] || missing_packages="$missing_packages cron"
+    if [ -n "$missing_packages" ]; then
+        say "Устанавливаю необходимые пакеты:$missing_packages"
+        "$OPKG_BIN" update || die "не удалось обновить список пакетов Entware"
+        # Only fixed package names assembled above, never user input.
+        "$OPKG_BIN" install $missing_packages || die "не удалось установить зависимости"
+    fi
+    command -v "$NDMC_BIN" >/dev/null 2>&1 || die "после установки команда ndmc не найдена"
+    [ -x "$CRON_INIT" ] || die "после установки служба cron не найдена"
+    if grep -q '^ENABLED=no' "$CRON_INIT" 2>/dev/null; then
+        sed -i 's/^ENABLED=no/ENABLED=yes/' "$CRON_INIT" || \
+            die "не удалось включить автозапуск cron"
+    fi
+    if ! "$PIDOF_BIN" cron >/dev/null 2>&1; then
+        "$CRON_INIT" start >/dev/null 2>&1 || die "не удалось запустить cron"
+        "$PIDOF_BIN" cron >/dev/null 2>&1 || die "процесс cron не запущен"
+    fi
+}
+
 show_summary() {
     run_command=$MANAGER_PATH
     if [ -L "$SHORT_COMMAND" ] && [ "$(readlink "$SHORT_COMMAND" 2>/dev/null)" = "$MANAGER_PATH" ]; then
@@ -162,7 +187,7 @@ show_summary() {
     say "  Удалить программу:      $run_command --uninstall"
     say "  Обычный текстовый режим: $run_command --plain"
     say ""
-    say "При первом запуске wgwm при необходимости установит ndmq и cron."
+    say "Зависимости ndmq и cron проверены; cron запущен и включён в автозапуск."
 }
 
 case "${1:-}" in
@@ -223,6 +248,7 @@ validate_script_version "$tmp_watchdog" watchdog
 validate_script_version "$tmp_manager" менеджер
 validate_sha256 "$tmp_watchdog" "$RELEASE_WATCHDOG_SHA256" watchdog
 validate_sha256 "$tmp_manager" "$RELEASE_MANAGER_SHA256" менеджера
+ensure_dependencies
 
 if [ "$FORCE_INSTALL" = yes ] && [ -f "$WATCHDOG_PATH" ] && [ ! -L "$WATCHDOG_PATH" ] && \
    [ -f "$MANAGER_PATH" ] && [ ! -L "$MANAGER_PATH" ]; then

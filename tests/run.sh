@@ -544,7 +544,7 @@ prepare_dialog_case() {
 }
 
 prepare_dialog_case manager-default-public-off
-printf '1\n\n\n' > "$INPUT_DEVICE"
+printf '1\n\n\n\n\n' > "$INPUT_DEVICE"
 open_console
 configure_job add "" > "$DIALOG_ROOT/output"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_TUNNEL_IP='10.0.0.1'" "автоподстановка внутреннего адреса"
@@ -555,6 +555,8 @@ assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "поро�
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='no'" "безопасный режим full-tunnel"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_1='1.1.1.1'" "первый контрольный адрес по умолчанию"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_2='8.8.8.8'" "второй контрольный адрес по умолчанию"
+assert_contains "$OUTPUT_DEVICE" 'Контрольный адрес 1 (IP или DNS-имя)' "адрес при создании задания"
+assert_contains "$OUTPUT_DEVICE" 'Контрольный адрес 2 (IP или DNS-имя)' "второй адрес при создании задания"
 if grep -F 'PING_COUNT —' "$OUTPUT_DEVICE" >/dev/null || \
    grep -F 'CHECK_INTERVAL —' "$OUTPUT_DEVICE" >/dev/null; then
     fail "при создании задания запрошены числовые параметры"
@@ -564,7 +566,7 @@ assert_contains "$DIALOG_ROOT/output" 'Изменить эти значения 
 pass "новое задание получает рекомендуемые параметры без лишних вопросов"
 
 # Редактирование существующего задания не спрашивает интерфейс повторно.
-printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+printf '\n\n\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
 open_console
 configure_job edit Wireguard0 >/dev/null
 if grep -F 'Выберите номер интерфейса' "$OUTPUT_DEVICE" >/dev/null; then
@@ -586,7 +588,7 @@ pass "менеджер позволяет изменить контрольны�
 
 # Явный yes включает проверку и предлагает Endpoint в качестве адреса.
 prepare_dialog_case manager-public-opt-in
-printf '1\n\ny\n\n' > "$INPUT_DEVICE"
+printf '1\n\ny\n\n\n\n' > "$INPUT_DEVICE"
 open_console
 configure_job add "" >/dev/null
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP='198.51.100.10'" "публичный Endpoint"
@@ -816,8 +818,8 @@ EOF
     show_detected_interfaces > "$TEST_ROOT/interfaces"
 )
 assert_contains "$TEST_ROOT/interfaces" 'WireGuard-интерфейсы:' "заголовок интерфейсов"
-assert_contains "$TEST_ROOT/interfaces" '<GREEN>  Wireguard0 — включена · Удалённый офис' "включённый интерфейс"
-assert_contains "$TEST_ROOT/interfaces" '<RED>  Wireguard2 — выключена · без описания' "выключенный интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<GREEN>  Wireguard0 — Удалённый офис · включена' "включённый интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<RED>  Wireguard2 — без описания · выключена' "выключенный интерфейс"
 assert_contains "$TEST_ROOT/interfaces" '<GRAY>  Wireguard3 — Два пира</COLOR>' "ненастроенный интерфейс"
 pass "все интерфейсы показываются со статусом и цветом проверки"
 
@@ -1003,7 +1005,25 @@ else
     cp "$MOCK_INSTALL_SOURCE/${url##*/}" "$output"
 fi
 EOF
-chmod 755 "$INSTALL_MOCK_BIN/id" "$INSTALL_MOCK_BIN/wget"
+cat > "$INSTALL_MOCK_BIN/opkg" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$MOCK_OPKG_LOG"
+if [ "${1:-}" = install ]; then
+    mkdir -p "$MOCK_INSTALL_OPT/bin" "$MOCK_INSTALL_OPT/etc/init.d"
+    printf '%s\n' '#!/bin/sh' 'exit 0' > "$MOCK_INSTALL_OPT/bin/ndmc"
+    chmod 755 "$MOCK_INSTALL_OPT/bin/ndmc"
+    printf '%s\n' '#!/bin/sh' 'ENABLED=no' \
+        'printf "%s\n" "$*" >> "$MOCK_CRON_LOG"' \
+        ': > "$MOCK_CRON_RUNNING"' > "$MOCK_INSTALL_OPT/etc/init.d/S10cron"
+    chmod 755 "$MOCK_INSTALL_OPT/etc/init.d/S10cron"
+fi
+EOF
+cat > "$INSTALL_MOCK_BIN/pidof" <<'EOF'
+#!/bin/sh
+[ -f "$MOCK_CRON_RUNNING" ]
+EOF
+chmod 755 "$INSTALL_MOCK_BIN/id" "$INSTALL_MOCK_BIN/wget" \
+    "$INSTALL_MOCK_BIN/opkg" "$INSTALL_MOCK_BIN/pidof"
 watchdog_release_hash=$(sha256sum "$WATCHDOG" | awk '{ print $1 }')
 manager_release_hash=$(sha256sum "$MANAGER" | awk '{ print $1 }')
 cat > "$INSTALL_ROOT/RELEASE" <<EOF
@@ -1017,17 +1037,22 @@ printf '\n' > "$INSTALL_ROOT/answer"
 installer_env() {
     MOCK_INSTALL_SOURCE="$REPO_DIR" \
     MOCK_RELEASE_FILE="$INSTALL_ROOT/RELEASE" \
+    MOCK_INSTALL_OPT="$INSTALL_OPT" \
+    MOCK_OPKG_LOG="$INSTALL_ROOT/opkg.log" \
+    MOCK_CRON_LOG="$INSTALL_ROOT/cron.log" \
+    MOCK_CRON_RUNNING="$INSTALL_ROOT/cron.running" \
     WG_WATCHDOG_OPT_ROOT="$INSTALL_OPT" \
     WG_WATCHDOG_TMP_DIR="$INSTALL_TMP" \
     WG_WATCHDOG_INPUT="$INSTALL_ROOT/answer" \
     WG_WATCHDOG_OUTPUT="$INSTALL_ROOT/prompt" \
-    WG_WATCHDOG_OPKG=/bin/true \
+    WG_WATCHDOG_OPKG="$INSTALL_MOCK_BIN/opkg" \
+    WG_WATCHDOG_PIDOF="$INSTALL_MOCK_BIN/pidof" \
     WG_WATCHDOG_RELEASE_MANIFEST_URL="$INSTALL_ROOT/RELEASE" \
     WG_WATCHDOG_RAW_REPOSITORY_URL=https://example.invalid \
     WG_WATCHDOG_RUN_DIR="$INSTALL_ROOT/run" \
     WG_WATCHDOG_STATE_DIR="$INSTALL_ROOT/state" \
-    WG_WATCHDOG_PATH="$INSTALL_MOCK_BIN:/usr/bin:/bin" \
-    WG_WATCHDOG_INSTALL_PATH="$INSTALL_MOCK_BIN:/usr/bin:/bin" \
+    WG_WATCHDOG_PATH="$INSTALL_MOCK_BIN:$INSTALL_OPT/bin:/usr/bin:/bin" \
+    WG_WATCHDOG_INSTALL_PATH="$INSTALL_MOCK_BIN:$INSTALL_OPT/bin:/usr/bin:/bin" \
         sh "$INSTALLER" "$@"
 }
 installer_env > "$INSTALL_ROOT/first-output"
@@ -1036,7 +1061,12 @@ assert_contains "$INSTALL_ROOT/first-output" "WG Watchdog $manager_version ус�
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
-pass "первая установка завершается summary без автозапуска"
+assert_contains "$INSTALL_ROOT/opkg.log" 'update' "opkg update при установке"
+assert_contains "$INSTALL_ROOT/opkg.log" 'install ndmq cron' "установка ndmq и cron"
+assert_contains "$INSTALL_ROOT/cron.log" 'start' "запуск cron установщиком"
+assert_contains "$INSTALL_OPT/etc/init.d/S10cron" 'ENABLED=yes' "автозапуск cron"
+assert_contains "$INSTALL_ROOT/first-output" 'Зависимости ndmq и cron проверены' "summary зависимостей"
+pass "первая установка ставит зависимости, запускает cron и не открывает менеджер"
 
 cat > "$INSTALL_OPT/bin/wg-watchdog-manager" <<'EOF'
 #!/bin/sh
@@ -1125,7 +1155,7 @@ pass "временные файлы уникальны, закрыты и кор
     TMP_FILES=""
     trap cleanup EXIT
     prepare_dialog_case cancel-delete
-    printf '1\n\n\n' > "$INPUT_DEVICE"
+    printf '1\n\n\n\n\n' > "$INPUT_DEVICE"
     open_console
     configure_job add "" >/dev/null
     printf '6\n1\nn\n0\n' > "$INPUT_DEVICE"
@@ -1143,14 +1173,14 @@ pass "отмена удаления не выводит ложное сообщ�
     TMP_FILES=""
     trap cleanup EXIT
     prepare_dialog_case edit-multi-peer
-    printf '1\n\n\n' > "$INPUT_DEVICE"
+    printf '1\n\n\n\n\n' > "$INPUT_DEVICE"
     open_console
     configure_job add "" >/dev/null
     load_config "$CONFIG_DIR/Wireguard0.conf"
     JOB_ID=Wireguard3
     WG_INTERFACE=Wireguard3
     write_config
-    printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+    printf '\n\n\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
     open_console
     configure_job edit Wireguard3 > "$DIALOG_ROOT/edit-output"
     if grep -F 'Выберите пир' "$OUTPUT_DEVICE" >/dev/null; then fail "повторный выбор пира при редактировании"; fi

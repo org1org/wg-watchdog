@@ -4,6 +4,7 @@ import fcntl
 import os
 from pathlib import Path
 import pty
+import re
 import select
 import signal
 import struct
@@ -16,12 +17,14 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
-             actions=None, job_answers=None, disabled_jobs=None):
+             actions=None, job_answers=None, disabled_jobs=None,
+             update_available=False):
     with tempfile.TemporaryDirectory(prefix="wgwm-pty-") as root:
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         env = dict(os.environ, TERM="xterm", WG_WATCHDOG_LIB_ONLY="yes",
                    TEST_ROOT=root, TEST_REPO=str(REPO), TEST_PLAIN=str(int(plain)))
+        env["TEST_UPDATE_AVAILABLE"] = str(int(update_available))
         env.pop("NO_COLOR", None)
         Path(root, "config").mkdir()
         for number in range(jobs):
@@ -44,6 +47,10 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
             acquire_manager_lock || exit 1
             MANAGER_LOCK_HELD=yes
             [ "$TEST_PLAIN" = 1 ] || ui_start
+            if [ "$TEST_UPDATE_AVAILABLE" = 1 ]; then
+                UPDATE_AVAILABLE=yes
+                REMOTE_VERSION=9.9.9
+            fi
             main_menu
         """
         process = subprocess.Popen(["sh", "-c", script], env=env,
@@ -109,6 +116,13 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                 assert "Выберите задание [1]".encode() not in output
             if disabled_jobs:
                 assert b"\x1b[1;31m" in output, "Отключённое задание не выделено красным"
+            if update_available:
+                green_update = re.compile(
+                    rb"\x1b\[1;32m\s*2\)\s+" +
+                    "Обновить программу до версии 9.9.9".encode()
+                )
+                assert green_update.search(output), \
+                    "Доступное обновление не выделено зелёным"
             return output.decode(errors="replace")
         finally:
             if process.poll() is None:
@@ -125,6 +139,7 @@ if __name__ == "__main__":
         dict(plain=True),
         dict(jobs=7, disabled_jobs=[2]),
         dict(jobs=2, actions=["3", "0"], job_answers=["0"]),
+        dict(update_available=True),
     ]:
         run_case(**case)
         print("ok PTY", case)

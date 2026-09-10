@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.8.1"
+VERSION="1.8.2"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -1372,31 +1372,31 @@ configure_job() {
         else
             INTERNET_CHECK=no
         fi
-        INTERNET_CHECK_TARGET_1=$default_internet_target_1
-        INTERNET_CHECK_TARGET_2=$default_internet_target_2
-        if [ "$INTERNET_CHECK" = yes ]; then
-            while :; do
-                read_answer "Контрольный адрес 1 (IP или DNS-имя)" "$default_internet_target_1"
-                if valid_address "$REPLY"; then
-                    INTERNET_CHECK_TARGET_1=$REPLY
-                    break
-                fi
-                say "Введите IP-адрес или DNS-имя без пробелов."
-            done
-            while :; do
-                read_answer "Контрольный адрес 2 (IP или DNS-имя)" "$default_internet_target_2"
-                if valid_address "$REPLY"; then
-                    INTERNET_CHECK_TARGET_2=$REPLY
-                    break
-                fi
-                say "Введите IP-адрес или DNS-имя без пробелов."
-            done
-        fi
     else
         INTERNET_CHECK=$default_internet_check
-        INTERNET_CHECK_TARGET_1=$default_internet_target_1
-        INTERNET_CHECK_TARGET_2=$default_internet_target_2
     fi
+
+    say ""
+    say "Контрольные адреса используются только при включённой проверке обычного интернета."
+    say "Можно указать IP-адреса или DNS-имена; ответ любого из двух считается успешным."
+    INTERNET_CHECK_TARGET_1=$default_internet_target_1
+    INTERNET_CHECK_TARGET_2=$default_internet_target_2
+    while :; do
+        read_answer "Контрольный адрес 1 (IP или DNS-имя)" "$default_internet_target_1"
+        if valid_address "$REPLY"; then
+            INTERNET_CHECK_TARGET_1=$REPLY
+            break
+        fi
+        say "Введите IP-адрес или DNS-имя без пробелов."
+    done
+    while :; do
+        read_answer "Контрольный адрес 2 (IP или DNS-имя)" "$default_internet_target_2"
+        if valid_address "$REPLY"; then
+            INTERNET_CHECK_TARGET_2=$REPLY
+            break
+        fi
+        say "Введите IP-адрес или DNS-имя без пробелов."
+    done
 
     if [ "$mode" = "edit" ]; then
         say "Нажмите Enter, чтобы принять значение в скобках."
@@ -1701,17 +1701,17 @@ show_detected_interfaces() {
         if [ -f "$interface_config" ]; then
             if ! load_config "$interface_config" "$iface"; then
                 interface_color=$COLOR_RED
-                interface_line="$interface_line — настройки повреждены"
+                interface_line="$interface_line · настройки повреждены"
                 say "${interface_color}${interface_line}${COLOR_RESET}"
                 continue
             fi
             if [ "$JOB_ID" = "$iface" ] && [ "$WG_INTERFACE" = "$iface" ]; then
                 if [ "$ENABLED" = yes ]; then
                     interface_color=$COLOR_GREEN
-                    interface_line="  $iface — включена · $description"
+                    interface_line="  $iface — $description · включена"
                 else
                     interface_color=$COLOR_RED
-                    interface_line="  $iface — выключена · $description"
+                    interface_line="  $iface — $description · выключена"
                 fi
             fi
         fi

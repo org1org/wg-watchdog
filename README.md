@@ -18,7 +18,9 @@
 
 ## Установка
 
-Требуются KeeneticOS 5+, Entware и SSH-доступ от `root`.
+Требуются KeeneticOS 5+, Entware и SSH-доступ от `root`. Установщик сам проверяет
+и при необходимости устанавливает `ndmq` и `cron`, включает автозапуск cron и
+запускает службу.
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/org1org/wg-watchdog/main/install.sh | sh
