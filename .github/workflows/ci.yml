@@ -35,13 +35,13 @@ jobs:
         run: shellcheck --shell=sh --severity=error install.sh wg-watchdog-manager.sh wg-watchdog.sh tests/run.sh
 
       - name: Run functional tests with sh
-        run: sh tests/run.sh
+        run: sudo sh tests/run.sh
 
       - name: Run functional tests with dash
-        run: dash tests/run.sh
+        run: sudo dash tests/run.sh
 
       - name: Run functional tests with BusyBox ash
-        run: busybox ash tests/run.sh
+        run: sudo busybox ash tests/run.sh
 
       - name: Run terminal tests
         run: python3 tests/terminal.py
