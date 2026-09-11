@@ -1,0 +1,13 @@
+#!/bin/sh
+
+cat <<'EOF'
+interface Wireguard8
+ description "Резервный офис"
+ interface-name wg8
+ ip address 172.16.6.2 255.255.255.255
+ wireguard peer abcdefghijklmnopqrstuvwxyz0123456789ABCDE=
+ endpoint 198.51.100.8:51820
+ allow-ips 0.0.0.0/0
+ connect
+!
+EOF

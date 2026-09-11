@@ -2,7 +2,7 @@
 
 # Interactive WireGuard watchdog manager for KeeneticOS.
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -16,6 +16,7 @@ STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
 UPDATE_DIR="${WG_WATCHDOG_UPDATE_DIR:-$OPT_ROOT/bin/.wg-watchdog-update}"
 TMP_DIR="${WG_WATCHDOG_TMP_DIR:-/tmp}"
+SYS_CLASS_NET="${WG_WATCHDOG_SYS_CLASS_NET:-/sys/class/net}"
 CRONTAB_PATH="$OPT_ROOT/etc/crontab"
 CRON_INIT="$OPT_ROOT/etc/init.d/S10cron"
 NDMC_BIN="${WG_WATCHDOG_NDMC:-ndmc}"
@@ -40,6 +41,7 @@ UI_ACTIVE=no
 UI_ROW=1
 UI_ROWS=24
 UI_COLS=80
+UI_SCROLL_MODE=no
 MANAGER_LOCK_HELD=no
 MAINTENANCE_HELD=no
 MANAGER_INTERFACE_NEEDS_UP=no
@@ -71,6 +73,20 @@ ui_clear() {
     UI_ROW=1
 }
 
+ui_scroll_start() {
+    [ "$UI_ACTIVE" = yes ] || return 0
+    ui_clear
+    UI_SCROLL_MODE=yes
+    printf '\033[?7h'
+}
+
+ui_scroll_stop() {
+    [ "$UI_ACTIVE" = yes ] || return 0
+    UI_SCROLL_MODE=no
+    UI_ROW=$((UI_ROWS - 1))
+    printf '\033[?7l'
+}
+
 ui_stop() {
     [ "$UI_ACTIVE" = yes ] || return 0
     printf '\033[0m\033[?7h\033[?25h\033[?1049l'
@@ -90,6 +106,10 @@ ui_pause() {
 }
 
 ui_text() {
+    if [ "$UI_SCROLL_MODE" = yes ]; then
+        printf '%s\n' "$*"
+        return 0
+    fi
     # Word wrapping uses byte lengths conservatively on BusyBox awk.
     # Long unbroken tokens are clipped by the terminal, never split mid-UTF-8.
     wrapped_text=$(printf '%s\n' "$*" | awk -v width="$((UI_COLS - 2))" '
@@ -115,6 +135,10 @@ EOF
 
 ui_prompt() {
     [ "$UI_ACTIVE" = yes ] || return 0
+    if [ "$UI_SCROLL_MODE" = yes ]; then
+        printf '%s\n> ' "$1" >&4
+        return 0
+    fi
     say "$1"
     printf '\033[%s;1H\033[2K> ' "$UI_ROW" >&4
     UI_ROW=$((UI_ROW + 1))
@@ -844,7 +868,7 @@ detect_interfaces() {
         function output() {
             if (is_wg) {
                 if (description == "") description = "без описания"
-                print interface_name "\t" description
+                print interface_name "\t" description "\t" short_name
             }
         }
         $1 == "interface" {
@@ -852,6 +876,7 @@ detect_interfaces() {
             interface_name = $2
             is_wg = (interface_name ~ /^Wireguard[0-9]+$/)
             description = ""
+            short_name = ""
             next
         }
         is_wg && $1 == "description" {
@@ -859,6 +884,10 @@ detect_interfaces() {
             description = $0
             gsub(/^"|"$/, "", description)
         }
+        is_wg && $1 ~ /^(interface-name|system-name|ifname|device|link-name)$/ && \
+            $2 ~ /^wg[0-9]+$/ { short_name = $2 }
+        is_wg && $1 == "wireguard" && $2 ~ /^(interface-name|system-name|ifname|device|link-name)$/ && \
+            $3 ~ /^wg[0-9]+$/ { short_name = $3 }
         END { output() }
     ')
 }
@@ -869,6 +898,29 @@ interface_description() {
         END { if (!found) print "без описания" }
     ')
     REPLY=$result
+}
+
+interface_short_name() {
+    result=$(printf '%s\n' "$INTERFACE_LIST" | awk -F '\t' -v wanted="$1" '
+        $1 == wanted { print $3; exit }
+    ')
+    if [ -z "$result" ]; then
+        interface_number=${1#Wireguard}
+        sys_candidate="wg$interface_number"
+        if [ -e "$SYS_CLASS_NET/$sys_candidate" ]; then
+            result=$sys_candidate
+        fi
+    fi
+    REPLY=$result
+}
+
+interface_label() {
+    interface_short_name "$1"
+    if [ -n "$REPLY" ]; then
+        REPLY="$1 ($REPLY)"
+    else
+        REPLY=$1
+    fi
 }
 
 interface_listen_port() {
@@ -905,8 +957,10 @@ choose_interface() {
         say "Доступные WireGuard-интерфейсы:"
         index=1
         default_index=1
-        while IFS="$(printf '\t')" read -r iface description; do
-            say "  $index) $iface — $description"
+        while IFS="$(printf '\t')" read -r iface description short_name; do
+            interface_label "$iface"
+            iface_label=$REPLY
+            say "  $index) $iface_label — $description"
             index=$((index + 1))
         done <<EOF
 $INTERFACE_LIST
@@ -922,6 +976,8 @@ EOF
             read_answer "Выберите номер интерфейса" "$default_index"
             if is_positive_integer "$REPLY" && [ "$REPLY" -le "$interface_count" ]; then
                 WG_INTERFACE=$(printf '%s\n' "$INTERFACE_LIST" | sed -n "${REPLY}p" | cut -f1)
+                interface_label "$WG_INTERFACE"
+                say "Выбран интерфейс: $REPLY."
                 return 0
             fi
             say "Введите номер от 1 до $interface_count."
@@ -1023,6 +1079,36 @@ EOF
     [ "$DETECTED_PUBLIC_IP" = "-" ] && DETECTED_PUBLIC_IP=""
     [ "$DETECTED_TUNNEL_IP" = "-" ] && DETECTED_TUNNEL_IP=""
     return 0
+}
+
+suggest_server_address() {
+    suggested_interface=$1
+    suggestion=$(printf '%s\n' "$RUNNING_CONFIG" | awk -v wanted="$suggested_interface" '
+        $1 == "interface" {
+            if (in_target) exit
+            in_target = ($2 == wanted)
+            next
+        }
+        in_target && $1 == "ip" && $2 == "address" {
+            address = $3
+            host_mask = ($4 == "255.255.255.255")
+            if (address ~ /\/32$/) {
+                sub(/\/32$/, "", address)
+                host_mask = 1
+            }
+            if (!host_mask) next
+            count = split(address, octet, ".")
+            if (count != 4) next
+            for (i = 1; i <= 4; i++) {
+                if (octet[i] !~ /^[0-9]+$/ || octet[i] + 0 > 255) next
+            }
+            if (octet[4] + 0 == 1) next
+            print address "\t" octet[1] "." octet[2] "." octet[3] ".1"
+            exit
+        }
+    ')
+    DETECTED_INTERFACE_IP=$(printf '%s\n' "$suggestion" | cut -f1)
+    SUGGESTED_SERVER_IP=$(printf '%s\n' "$suggestion" | cut -f2)
 }
 
 reset_config_values() {
@@ -1250,16 +1336,26 @@ configure_job() {
         old_enabled=yes
     fi
 
+    ui_scroll_start
+    if [ "$UI_ACTIVE" = yes ]; then
+        show_header
+        say ""
+    fi
+
     if [ "$mode" = "edit" ]; then
         detect_interfaces
         WG_INTERFACE=$old_interface
         interface_description "$WG_INTERFACE"
-        info "Редактируется задание для $WG_INTERFACE — $REPLY"
+        selected_description=$REPLY
+        interface_label "$WG_INTERFACE"
+        info "Редактируется задание для $REPLY — $selected_description"
     elif [ -n "$original_job" ]; then
         detect_interfaces
         WG_INTERFACE=$original_job
         interface_description "$WG_INTERFACE"
-        info "Настраивается задание для $WG_INTERFACE — $REPLY"
+        selected_description=$REPLY
+        interface_label "$WG_INTERFACE"
+        info "Настраивается задание для $REPLY — $selected_description"
     else
         choose_interface ""
     fi
@@ -1269,6 +1365,7 @@ configure_job() {
         result_card warning "Для $JOB_ID уже существует задание." \
             "Новое задание не создано." \
             "Используйте пункт «Изменить задание»."
+        ui_scroll_stop
         return 1
     fi
 
@@ -1293,13 +1390,25 @@ configure_job() {
         say "Внутренний адрес сервера не удалось определить автоматически."
         say "Он отсутствует в конфигурации, если в Allowed IPs указана только сеть или 0.0.0.0/0."
         say "Введите адрес сервера внутри WireGuard-туннеля вручную."
+        suggest_server_address "$WG_INTERFACE"
+        if [ -n "$SUGGESTED_SERVER_IP" ]; then
+            say "Возможный адрес сервера: $SUGGESTED_SERVER_IP."
+            say "Это предположение по адресу интерфейса $DETECTED_INTERFACE_IP/32 — проверьте его вручную."
+            say "Подсказка не будет подставлена автоматически."
+        fi
         say ""
     fi
 
     while :; do
+        if [ -n "$default_server" ]; then
+            say "Enter — использовать найденный адрес $default_server."
+        else
+            say "Введите адрес вручную; Enter без значения не продолжит настройку."
+        fi
         read_answer "Введите внутренний IP-адрес WireGuard-сервера" "$default_server"
         if valid_address "$REPLY"; then
             WG_SERVER_TUNNEL_IP=$REPLY
+            say "Выбран внутренний адрес: $WG_SERVER_TUNNEL_IP."
             break
         fi
         say "Введите IP-адрес или имя хоста без пробелов."
@@ -1310,17 +1419,15 @@ configure_job() {
         say "Сервер отвечает на ping."
     else
         say "Сервер не ответил. Возможно, туннель сейчас не работает или ICMP запрещён."
+        say "Enter — отменить настройку."
         confirm "Продолжить настройку?" || {
             result_card cancelled "Настройка задания не сохранена."
+            ui_scroll_stop
             return 1
         }
     fi
 
-    if [ "$UI_ACTIVE" = yes ]; then
-        ui_clear
-    else
-        say ""
-    fi
+    say ""
     say "Необязательная проверка публичного адреса помогает отличить отключённый"
     say "сервер от неисправного туннеля. Включайте её только если публичный адрес"
     say "стабильно отвечает на ping: иначе watchdog может пропустить восстановление."
@@ -1331,19 +1438,34 @@ configure_job() {
     if [ -n "$default_public_ip" ]; then
         suggested_public_ip=$default_public_ip
         say "Сейчас используется публичный адрес: $default_public_ip"
+        say "Enter — продолжить проверять этот адрес."
         if confirm_yes "Продолжать проверять публичный адрес?"; then
             use_public_probe=yes
         fi
-    elif confirm "Использовать проверку публичного адреса?"; then
-        use_public_probe=yes
+    else
+        say "Enter — не включать проверку публичного адреса."
+        if confirm "Использовать проверку публичного адреса?"; then
+            use_public_probe=yes
+        fi
+    fi
+    if [ "$use_public_probe" = yes ]; then
+        say "Проверка публичного адреса: включена."
+    else
+        say "Проверка публичного адреса: выключена."
     fi
 
     WG_SERVER_PUBLIC_IP=""
     if [ "$use_public_probe" = "yes" ]; then
         while :; do
+            if [ -n "$suggested_public_ip" ]; then
+                say "Enter — использовать найденный адрес $suggested_public_ip."
+            else
+                say "Введите адрес вручную; Enter без значения не продолжит настройку."
+            fi
             read_answer "Публичный IP или DNS-имя WG-сервера" "$suggested_public_ip"
             if valid_address "$REPLY"; then
                 WG_SERVER_PUBLIC_IP=$REPLY
+                say "Выбран публичный адрес: $WG_SERVER_PUBLIC_IP."
                 break
             fi
             say "Введите IP-адрес или имя хоста без пробелов."
@@ -1355,6 +1477,7 @@ configure_job() {
         else
             warn "Публичный адрес не ответил. Если ICMP на нём запрещён,"
             say "лучше оставить это поле пустым, иначе watchdog будет пропускать восстановление."
+            say "Enter — не сохранять этот адрес."
             confirm "Сохранить этот публичный адрес несмотря на отсутствие ответа?" || \
                 WG_SERVER_PUBLIC_IP=""
         fi
@@ -1366,15 +1489,19 @@ configure_job() {
         say "восстановление, если эти адреса маршрутизируются через сам WireGuard."
         say "Для full-tunnel её следует оставить выключенной."
         if [ "$default_internet_check" = yes ]; then
+            say "Enter — продолжить проверять обычный интернет."
             if confirm_yes "Продолжать проверять обычный интернет?"; then
                 INTERNET_CHECK=yes
             else
                 INTERNET_CHECK=no
             fi
-        elif confirm "Включить проверку обычного интернета?"; then
-            INTERNET_CHECK=yes
         else
-            INTERNET_CHECK=no
+            say "Enter — оставить проверку обычного интернета выключенной."
+            if confirm "Включить проверку обычного интернета?"; then
+                INTERNET_CHECK=yes
+            else
+                INTERNET_CHECK=no
+            fi
         fi
     else
         INTERNET_CHECK=$default_internet_check
@@ -1387,6 +1514,7 @@ configure_job() {
         say "Укажите два контрольных адреса обычного интернета."
         say "Можно использовать IP-адреса или DNS-имена; ответа одного из двух достаточно."
         while :; do
+            say "Enter — использовать $default_internet_target_1."
             read_answer "Контрольный адрес 1 (IP или DNS-имя)" "$default_internet_target_1"
             if valid_address "$REPLY"; then
                 INTERNET_CHECK_TARGET_1=$REPLY
@@ -1395,6 +1523,7 @@ configure_job() {
             say "Введите IP-адрес или DNS-имя без пробелов."
         done
         while :; do
+            say "Enter — использовать $default_internet_target_2."
             read_answer "Контрольный адрес 2 (IP или DNS-имя)" "$default_internet_target_2"
             if valid_address "$REPLY"; then
                 INTERNET_CHECK_TARGET_2=$REPLY
@@ -1434,6 +1563,7 @@ configure_job() {
         say "  проверка обычного интернета выключена (безопасно для full-tunnel)."
         say "Изменить эти значения можно через пункт «Изменить задание»."
     fi
+    ui_scroll_stop
 }
 
 toggle_job() {
@@ -1502,8 +1632,11 @@ show_job_status() {
     detect_interfaces
     interface_listen_port "$WG_INTERFACE"
     status_listen_port=$REPLY
+    interface_short_name "$WG_INTERFACE"
+    status_short_name=$REPLY
     say ""
     say "Статус $SELECTED_JOB:"
+    say "  Системное имя:           ${status_short_name:-не определено}"
     say "  Состояние задания:        $state"
     say "  Внутренний адрес сервера: $WG_SERVER_TUNNEL_IP"
     say "  Публичный адрес сервера:  ${WG_SERVER_PUBLIC_IP:-не используется}"
@@ -1710,16 +1843,35 @@ uninstall_program() {
 
 show_header() {
     if [ "${1:-compact}" = main ]; then
-        say "${COLOR_CYAN} __      __  ___ __  __${COLOR_RESET}"
-        say "${COLOR_CYAN} \\ \\ /\\ / / / __|  \\/  |${COLOR_RESET}"
-        say "${COLOR_CYAN}  \\ V  V / | (_ | |\\/| |${COLOR_RESET}"
-        say "${COLOR_CYAN}   \\_/\\_/   \\___|_|  |_|${COLOR_RESET}"
-        say "${COLOR_CYAN}      WATCHDOG MANAGER${COLOR_RESET}"
-        say "Контроль WireGuard · Версия $VERSION · Автор: $AUTHOR"
+        center_header_line ' __        __  ____  __  __'
+        center_header_line ' \ \      / / / ___||  \/  |'
+        center_header_line '  \ \ /\ / / | |  _| |\/| |'
+        center_header_line '   \ V  V /  | |_| | |  | |'
+        center_header_line '    \_/\_/    \____|_|  |_|'
+        center_header_line 'WG Watchdog Manager'
+        center_header_line "WireGuard recovery | v$VERSION | $AUTHOR"
     else
         say "${COLOR_CYAN}WG Watchdog Manager  /  $VERSION${COLOR_RESET}"
         say "Автор: $AUTHOR · Контроль WireGuard"
     fi
+}
+
+center_header_line() {
+    header_text=$1
+    if [ "$UI_ACTIVE" != yes ]; then
+        printf '%s\n' "$header_text"
+        return 0
+    fi
+    header_width=${#header_text}
+    if [ "$header_width" -lt "$UI_COLS" ]; then
+        header_padding=$(((UI_COLS - header_width) / 2))
+    else
+        header_padding=0
+    fi
+    [ "$UI_ROW" -lt "$((UI_ROWS - 2))" ] || ui_pause
+    printf '\033[%s;1H\033[2K%*s%s%s%s' \
+        "$UI_ROW" "$header_padding" '' "$COLOR_CYAN" "$header_text" "$COLOR_RESET"
+    UI_ROW=$((UI_ROW + 1))
 }
 
 show_interface_index() {
@@ -1728,12 +1880,14 @@ show_interface_index() {
     INTERFACE_INDEX=$REPLY
     INTERFACE_COUNT=0
     say "WireGuard-интерфейсы:"
-    while IFS="$(printf '\t')" read -r iface description; do
+    while IFS="$(printf '\t')" read -r iface description short_name; do
         [ -n "$iface" ] || continue
         INTERFACE_COUNT=$((INTERFACE_COUNT + 1))
         printf '%s\n' "$iface" >> "$INTERFACE_INDEX"
         interface_color=$COLOR_GRAY
-        interface_line="  $INTERFACE_COUNT) $iface — $description"
+        interface_label "$iface"
+        iface_label=$REPLY
+        interface_line="  $INTERFACE_COUNT) $iface_label — $description"
         interface_config="$CONFIG_DIR/$iface.conf"
         if [ -f "$interface_config" ]; then
             if ! load_config "$interface_config" "$iface"; then
@@ -1745,10 +1899,10 @@ show_interface_index() {
             if [ "$JOB_ID" = "$iface" ] && [ "$WG_INTERFACE" = "$iface" ]; then
                 if [ "$ENABLED" = yes ]; then
                     interface_color=$COLOR_GREEN
-                    interface_line="  $INTERFACE_COUNT) $iface — $description · включена"
+                    interface_line="  $INTERFACE_COUNT) $iface_label — $description · включена"
                 else
                     interface_color=$COLOR_RED
-                    interface_line="  $INTERFACE_COUNT) $iface — $description · выключена"
+                    interface_line="  $INTERFACE_COUNT) $iface_label — $description · выключена"
                 fi
             fi
         fi
@@ -1802,8 +1956,10 @@ interface_menu() {
         detect_interfaces
         interface_description "$selected_interface"
         selected_description=$REPLY
+        interface_label "$selected_interface"
+        selected_interface_label=$REPLY
         say ""
-        say "Интерфейс: $selected_interface — $selected_description"
+        say "Интерфейс: $selected_interface_label — $selected_description"
         selected_config="$CONFIG_DIR/$selected_interface.conf"
         configured=no
         damaged=no
@@ -1849,7 +2005,7 @@ interface_menu() {
             ui_clear
             show_header
             say ""
-            say "Интерфейс: $selected_interface — $selected_description"
+            say "Интерфейс: $selected_interface_label — $selected_description"
             say ""
         fi
         ACTION_PAUSE=yes

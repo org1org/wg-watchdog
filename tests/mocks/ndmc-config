@@ -6,6 +6,7 @@ interface GigabitEthernet0
 !
 interface Wireguard0
  description "Удалённый офис"
+ interface-name wg0
  security-level private
  ip address 10.0.0.2 255.255.255.255
  wireguard listen-port 16669
@@ -15,6 +16,7 @@ interface Wireguard0
  connect
 !
 interface Wireguard2
+ interface-name wg2
  security-level private
  ip address 10.2.0.2 255.255.255.255
  wireguard peer zyxwvutsrqponmlkjihgfedcba9876543210ABCDE=
@@ -24,6 +26,7 @@ interface Wireguard2
 !
 interface Wireguard3
  description "Два пира"
+ interface-name wg3
  ip address 10.3.0.2 255.255.255.255
  wireguard peer firstpeerABCDEFGHIJKLMNOPQRSTUVWXYZ012345=
  endpoint first.example.test:51820

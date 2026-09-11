@@ -456,6 +456,10 @@ if printf '%s\n' "$INTERFACE_LIST" | grep -F 'GigabitEthernet0' >/dev/null; then
 fi
 pass "парсер находит интерфейсы WireGuard и их описания"
 
+assert_contains_text=$(printf '%s\n' "$INTERFACE_LIST" | grep -F 'wg0' || true)
+[ -n "$assert_contains_text" ] || fail "не найдено короткое имя wg0"
+pass "парсер находит короткие системные имена WireGuard-интерфейсов"
+
 interface_listen_port Wireguard0
 assert_equal "$REPLY" 16669 "фиксированный локальный порт"
 interface_listen_port Wireguard2
@@ -481,6 +485,37 @@ detect_peer_defaults Wireguard3 >/dev/null
 assert_equal "$DETECTED_PUBLIC_IP" "2001:db8::10" "IPv6 endpoint второго пира"
 assert_equal "$DETECTED_TUNNEL_IP" "10.3.0.10" "внутренний адрес второго пира"
 pass "при нескольких пирах адреса берутся из выбранного пира"
+
+# При отсутствии адреса сервера адрес интерфейса даёт только неподтверждённую подсказку.
+RUNNING_CONFIG=$(cat <<'EOF'
+interface Wireguard8
+ ip address 172.16.6.2/32
+ wireguard peer testpeer=
+ endpoint 198.51.100.8:51820
+ allow-ips 0.0.0.0/0
+ connect
+!
+EOF
+)
+suggest_server_address Wireguard8
+assert_equal "$DETECTED_INTERFACE_IP" 172.16.6.2 "адрес интерфейса для подсказки"
+assert_equal "$SUGGESTED_SERVER_IP" 172.16.6.1 "эвристический адрес сервера"
+RUNNING_CONFIG='interface Wireguard9
+ ip address 172.16.6.1/32'
+suggest_server_address Wireguard9
+assert_equal "$SUGGESTED_SERVER_IP" "" "адрес .1 не должен подсказывать сам себя"
+pass "адрес .1 предлагается только как осторожная IPv4-подсказка"
+
+# Короткое имя можно получить из sysfs, если его нет в running-config.
+SYS_CLASS_NET="$TEST_ROOT/sys-class-net"
+mkdir -p "$SYS_CLASS_NET/wg8"
+INTERFACE_LIST='Wireguard8	без описания	'
+interface_short_name Wireguard8
+assert_equal "$REPLY" wg8 "короткое имя из sysfs"
+pass "короткое имя интерфейса имеет безопасный резервный источник"
+SYS_CLASS_NET=/sys/class/net
+NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
+detect_interfaces
 
 # Enter подтверждает продолжение, явный отрицательный ответ отменяет его.
 printf '\n' > "$TEST_ROOT/answer-yes"
@@ -573,6 +608,20 @@ assert_contains "$DIALOG_ROOT/output" 'Изменить эти значения 
 assert_contains "$DIALOG_ROOT/output" 'фиксированный локальный порт WireGuard: 16669' "предупреждение listen-port"
 pass "новое задание получает рекомендуемые параметры без лишних вопросов"
 
+# Эвристика .1 выводится как подсказка, но пустой Enter не принимает её.
+(
+    prepare_dialog_case manager-server-suggestion
+    NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config-no-server"
+    printf '1\n\n172.16.6.1\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job add "" > "$DIALOG_ROOT/output"
+    assert_contains "$DIALOG_ROOT/output" 'Возможный адрес сервера: 172.16.6.1.' "эвристическая подсказка"
+    assert_contains "$DIALOG_ROOT/output" 'Подсказка не будет подставлена автоматически.' "отказ от автоподстановки"
+    assert_contains "$DIALOG_ROOT/output" 'Enter без значения не продолжит настройку.' "явное действие пустого Enter"
+    assert_contains "$CONFIG_DIR/Wireguard8.conf" "WG_SERVER_TUNNEL_IP='172.16.6.1'" "ручной ввод подсказанного адреса"
+)
+pass "эвристический адрес требует ручного ввода"
+
 # Выбор интерфейса в главном меню передаётся в настройку без второго вопроса.
 (
     prepare_dialog_case manager-context-add
@@ -587,8 +636,7 @@ pass "новое задание получает рекомендуемые па
 )
 pass "создание задания использует выбранный интерфейс без повторного вопроса"
 
-# Полноэкранный режим начинает раздел публичной проверки с новой страницы,
-# чтобы пояснение и вопрос не разделялись автоматической очисткой экрана.
+# Мастер очищает экран только в начале и сохраняет предыдущие шаги.
 (
     prepare_dialog_case manager-public-page
     printf '1\n\n\n' > "$INPUT_DEVICE"
@@ -600,12 +648,15 @@ pass "создание задания использует выбранный и
     configure_job add "" > "$DIALOG_ROOT/page-output"
     sed -n '/^<CLEAR>$/,/^<PROMPT>Использовать проверку публичного адреса?/p' \
         "$DIALOG_ROOT/page-output" > "$DIALOG_ROOT/public-section"
+    assert_contains "$DIALOG_ROOT/public-section" 'Выбран интерфейс: Wireguard0 (wg0).' "начало мастера"
+    assert_contains "$DIALOG_ROOT/public-section" 'Выбран внутренний адрес: 10.0.0.1.' "сохранённый выбор"
     assert_contains "$DIALOG_ROOT/public-section" 'Необязательная проверка публичного адреса' "пояснение на странице публичной проверки"
+    assert_contains "$DIALOG_ROOT/public-section" 'Enter — не включать проверку публичного адреса.' "явное действие Enter"
     assert_contains "$DIALOG_ROOT/public-section" '<PROMPT>Использовать проверку публичного адреса? [y/N]' "вопрос на странице публичной проверки"
     clear_count=$(grep -c '^<CLEAR>$' "$DIALOG_ROOT/public-section")
     assert_equal "$clear_count" 1 "очистка между пояснением и вопросом"
 )
-pass "пояснение и вопрос публичной проверки остаются на одном экране"
+pass "мастер настройки сохраняет историю и явно объясняет Enter"
 
 # Редактирование существующего задания не спрашивает интерфейс повторно.
 printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
@@ -739,7 +790,7 @@ INPUT_DEVICE="$ACTION_ROOT/input"
 OUTPUT_DEVICE="$ACTION_ROOT/prompts"
 open_console
 interface_menu Wireguard0 > "$ACTION_ROOT/configured"
-assert_contains "$ACTION_ROOT/configured" 'Интерфейс: Wireguard0 — Удалённый офис' "контекст интерфейса"
+assert_contains "$ACTION_ROOT/configured" 'Интерфейс: Wireguard0 (wg0) — Удалённый офис' "контекст интерфейса"
 assert_contains "$ACTION_ROOT/configured" '1) Запустить проверку сейчас' "ручная проверка"
 assert_contains "$ACTION_ROOT/configured" '3) Показать последние события' "просмотр событий"
 assert_contains "$ACTION_ROOT/configured" '6) Принудительно перезапустить интерфейс' "ручной restart"
@@ -843,7 +894,7 @@ watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$WATCHDOG" | head -n 1)
 installer_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$INSTALLER" | head -n 1)
 assert_equal "$watchdog_version" "$manager_version" "версия watchdog"
 assert_equal "$installer_version" "$manager_version" "версия установщика"
-assert_equal "$manager_version" 1.0.0 "номер публичного выпуска"
+assert_equal "$manager_version" 1.0.1 "номер публичного выпуска"
 pass "версии исполняемых файлов совпадают"
 
 # Семантическое сравнение и строгий манифест выпуска.
@@ -912,9 +963,9 @@ EOF
     show_interface_index > "$TEST_ROOT/interfaces"
 )
 assert_contains "$TEST_ROOT/interfaces" 'WireGuard-интерфейсы:' "заголовок интерфейсов"
-assert_contains "$TEST_ROOT/interfaces" '<GREEN>  1) Wireguard0 — Удалённый офис · включена' "включённый интерфейс"
-assert_contains "$TEST_ROOT/interfaces" '<RED>  2) Wireguard2 — без описания · выключена' "выключенный интерфейс"
-assert_contains "$TEST_ROOT/interfaces" '<GRAY>  3) Wireguard3 — Два пира</COLOR>' "ненастроенный интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<GREEN>  1) Wireguard0 (wg0) — Удалённый офис · включена' "включённый интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<RED>  2) Wireguard2 (wg2) — без описания · выключена' "выключенный интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<GRAY>  3) Wireguard3 (wg3) — Два пира</COLOR>' "ненастроенный интерфейс"
 pass "все интерфейсы показываются со статусом и цветом проверки"
 
 # Основное меню выбирает интерфейс, а управление программой оставляет отдельным блоком.
@@ -928,7 +979,7 @@ OUTPUT_DEVICE="$MENU_ROOT/prompts-empty"
 open_console
 UPDATE_AVAILABLE=no
 main_menu > "$MENU_ROOT/menu-empty"
-assert_contains "$MENU_ROOT/menu-empty" '1) Wireguard0 — Удалённый офис' "выбор первого интерфейса"
+assert_contains "$MENU_ROOT/menu-empty" '1) Wireguard0 (wg0) — Удалённый офис' "выбор первого интерфейса"
 assert_contains "$MENU_ROOT/menu-empty" '4) Проверить обновления' "обновление после интерфейсов"
 assert_contains "$MENU_ROOT/menu-empty" '5) Удалить WG Watchdog Manager' "удаление программы"
 assert_contains "$MENU_ROOT/menu-empty" '0) Выход' "выход из программы"
@@ -940,7 +991,7 @@ INPUT_DEVICE="$MENU_ROOT/input-full"
 OUTPUT_DEVICE="$MENU_ROOT/prompts-full"
 open_console
 main_menu > "$MENU_ROOT/menu-full"
-assert_contains "$MENU_ROOT/menu-full" '1) Wireguard0 — Удалённый офис · включена' "статус в главном меню"
+assert_contains "$MENU_ROOT/menu-full" '1) Wireguard0 (wg0) — Удалённый офис · включена' "статус в главном меню"
 assert_contains "$MENU_ROOT/menu-full" '4) Wireguard1 — интерфейс не найден · выключена' "недоступное настроенное задание"
 assert_contains "$MENU_ROOT/menu-full" '5) Проверить обновления' "общее обновление"
 if grep -F 'Запустить проверку сейчас' "$MENU_ROOT/menu-full" >/dev/null; then

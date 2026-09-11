@@ -2,7 +2,7 @@
 
 # WG Watchdog Manager worker for KeeneticOS + Entware
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-/opt/etc/wg-watchdog.d}"
 STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"

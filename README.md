@@ -1,18 +1,18 @@
 <div align="center">
 
 <pre>
- __      __  ___ __  __
- \ \ /\ / / / __|  \/  |
-  \ V  V / | (_ | |\/| |
-   \_/\_/   \___|_|  |_|
-      WATCHDOG MANAGER
+ __        __  ____  __  __
+ \ \      / / / ___||  \/  |
+  \ \ /\ / / | |  _| |\/| |
+   \ V  V /  | |_| | |  | |
+    \_/\_/    \____|_|  |_|
 </pre>
 
 ### WG Watchdog Manager
 
 Лёгкий менеджер автоматического восстановления WireGuard на KeeneticOS.
 
-[![version](https://img.shields.io/badge/version-1.0.0-blue)](https://github.com/org1org/wg-watchdog/releases/latest)
+[![version](https://img.shields.io/badge/version-1.0.1-blue)](https://github.com/org1org/wg-watchdog/releases/latest)
 ![shell](https://img.shields.io/badge/shell-POSIX%20sh-4EAA25)
 ![platform](https://img.shields.io/badge/platform-KeeneticOS%205%2B-009EE2)
 ![environment](https://img.shields.io/badge/environment-Entware-555555)
