@@ -30,7 +30,7 @@ jobs:
             "$(sed -n 's/^MANAGER_SHA256=//p' RELEASE)" wg-watchdog-manager.sh | sha256sum -c -
           sh -n install.sh wg-watchdog.sh wg-watchdog-manager.sh tests/run.sh
           dash -n install.sh wg-watchdog.sh wg-watchdog-manager.sh tests/run.sh
-          sh tests/run.sh
+          sudo sh tests/run.sh
           python3 tests/terminal.py
 
       - name: Create tag and release
