@@ -2,7 +2,7 @@
 
 # Interactive job manager for WG Watchdog.
 
-VERSION="1.8.4"
+VERSION="1.8.5"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -46,6 +46,8 @@ UI_ROWS=24
 UI_COLS=80
 MANAGER_LOCK_HELD=no
 MAINTENANCE_HELD=no
+MANAGER_INTERFACE_NEEDS_UP=no
+MANAGER_RECOVERY_INTERFACE=""
 WAIT_SECONDS=20
 SLEEP_BIN=sleep
 
@@ -152,6 +154,10 @@ cleanup() {
 }
 finish() {
     cleanup
+    if [ "$MANAGER_INTERFACE_NEEDS_UP" = yes ] && [ -n "$MANAGER_RECOVERY_INTERFACE" ]; then
+        "$NDMC_BIN" -c "interface $MANAGER_RECOVERY_INTERFACE up" >/dev/null 2>&1 || true
+        MANAGER_INTERFACE_NEEDS_UP=no
+    fi
     end_maintenance
     release_manager_lock
     ui_stop
@@ -1294,11 +1300,17 @@ configure_job() {
         WG_INTERFACE=$old_interface
         interface_description "$WG_INTERFACE"
         info "Редактируется задание для $WG_INTERFACE — $REPLY"
+    elif [ -n "$original_job" ]; then
+        detect_interfaces
+        WG_INTERFACE=$original_job
+        interface_description "$WG_INTERFACE"
+        info "Настраивается задание для $WG_INTERFACE — $REPLY"
     else
         choose_interface ""
     fi
     JOB_ID=$WG_INTERFACE
-    if [ -f "$CONFIG_DIR/$JOB_ID.conf" ] && [ "$JOB_ID" != "$original_job" ]; then
+    if [ -f "$CONFIG_DIR/$JOB_ID.conf" ] && \
+       { [ "$mode" != edit ] || [ "$JOB_ID" != "$original_job" ]; }; then
         result_card warning "Для $JOB_ID уже существует задание." \
             "Новое задание не создано." \
             "Используйте пункт «Изменить задание»."
@@ -1469,65 +1481,9 @@ configure_job() {
     fi
 }
 
-build_job_index() {
-    display_mode=${1:-page}
-    detect_interfaces
-    make_temp jobs
-    JOB_INDEX=$REPLY
-    count=0
-    for config_file in "$CONFIG_DIR"/*.conf; do
-        [ -f "$config_file" ] || continue
-        config_name=${config_file##*/}
-        expected_job=${config_name%.conf}
-        load_config "$config_file" "$expected_job" || continue
-        valid_interface "$JOB_ID" || continue
-        count=$((count + 1))
-        printf '%s\n' "$JOB_ID" >> "$JOB_INDEX"
-        interface_description "$WG_INTERFACE"
-        description=$REPLY
-        if [ "$ENABLED" = "yes" ]; then
-            state="включено"
-            state_color=$COLOR_GREEN
-        else
-            state="выключено"
-            state_color=$COLOR_RED
-        fi
-        if [ "$display_mode" = quiet ]; then
-            :
-        elif [ "$UI_ACTIVE" = yes ]; then
-            say "$state_color$count. $WG_INTERFACE — $state$COLOR_RESET"
-        else
-            printf '  %s%s. %s — %s; сервер %s; каждые %s мин.; %s%s\n' \
-                "$state_color" "$count" "$WG_INTERFACE" "$description" \
-                "$WG_SERVER_TUNNEL_IP" "$CHECK_INTERVAL" "$state" "$COLOR_RESET"
-        fi
-    done
-    JOB_COUNT=$count
-}
-
-select_job() {
-    say "Настроенные задания:"
-    build_job_index all
-    [ "$JOB_COUNT" -gt 0 ] || { say "  Нет настроенных заданий."; return 1; }
-    say ""
-    say "  0) Вернуться в главное меню"
-    while :; do
-        read_answer "$1" ""
-        if [ "$REPLY" = 0 ]; then
-            ACTION_PAUSE=no
-            SELECTED_JOB=""
-            return 1
-        fi
-        if is_positive_integer "$REPLY" && [ "$REPLY" -le "$JOB_COUNT" ]; then
-            SELECTED_JOB=$(sed -n "${REPLY}p" "$JOB_INDEX")
-            return 0
-        fi
-        say "Введите номер от 1 до $JOB_COUNT или 0 для возврата."
-    done
-}
-
 toggle_job() {
-    select_job "Выберите задание" || return
+    SELECTED_JOB=$1
+    valid_interface "$SELECTED_JOB" || return 1
     config_file="$CONFIG_DIR/$SELECTED_JOB.conf"
     load_config "$config_file" "$SELECTED_JOB" || {
         result_card error "Настройки $SELECTED_JOB повреждены." \
@@ -1547,7 +1503,8 @@ toggle_job() {
 }
 
 delete_job() {
-    select_job "Какое задание удалить" || return
+    SELECTED_JOB=$1
+    valid_interface "$SELECTED_JOB" || return 1
     confirm "Удалить задание $SELECTED_JOB и его настройки?" || {
         result_card cancelled "Задание $SELECTED_JOB сохранено без изменений."
         return 0
@@ -1568,7 +1525,8 @@ delete_job() {
 }
 
 show_job_status() {
-    select_job "Какое задание показать" || return
+    SELECTED_JOB=$1
+    valid_interface "$SELECTED_JOB" || return 1
     load_config "$CONFIG_DIR/$SELECTED_JOB.conf" "$SELECTED_JOB" || {
         result_card error "Настройки $SELECTED_JOB повреждены." \
             "Подробный статус недоступен."
@@ -1618,7 +1576,8 @@ show_job_status() {
 }
 
 run_job_now() {
-    select_job "Какое задание проверить сейчас" || return
+    SELECTED_JOB=$1
+    valid_interface "$SELECTED_JOB" || return 1
     say "Запускаю проверку $SELECTED_JOB..."
     run_visible "$WATCHDOG_PATH" --job "$SELECTED_JOB" --force
     result=$?
@@ -1630,6 +1589,78 @@ run_job_now() {
             "Watchdog сообщил об ошибке выполнения." \
             "Посмотрите системный журнал: $WATCHDOG_LOG_COMMAND"
     fi
+}
+
+show_job_events() {
+    SELECTED_JOB=$1
+    valid_interface "$SELECTED_JOB" || return 1
+    make_temp keenetic-log
+    log_file=$REPLY
+    if ! "$NDMC_BIN" -c "show log" > "$log_file" 2>&1; then
+        result_card error "Не удалось получить системный журнал KeeneticOS." \
+            "Команда ndmc завершилась с ошибкой."
+        return 1
+    fi
+    say "Последние события $SELECTED_JOB:"
+    log_lines=$(awk -v marker="[$SELECTED_JOB]" '
+        index($0, "wg-watchdog") && index($0, marker) {
+            count++
+            lines[(count - 1) % 20] = $0
+        }
+        END {
+            if (count == 0) exit
+            first = count > 20 ? count - 19 : 1
+            for (i = first; i <= count; i++) print lines[(i - 1) % 20]
+        }
+    ' "$log_file")
+    if [ -n "$log_lines" ]; then
+        while IFS= read -r log_line; do say "$log_line"; done <<EOF
+$log_lines
+EOF
+    else
+        say "  События этого задания в текущем системном журнале не найдены."
+    fi
+    say ""
+    say "Показано не более 20 записей; отдельный файл журнала не создаётся."
+}
+
+force_restart_job() {
+    SELECTED_JOB=$1
+    valid_interface "$SELECTED_JOB" || return 1
+    load_config "$CONFIG_DIR/$SELECTED_JOB.conf" "$SELECTED_JOB" || {
+        result_card error "Настройки $SELECTED_JOB повреждены." \
+            "Принудительный перезапуск не выполнялся."
+        return 1
+    }
+    warn "Интерфейс $WG_INTERFACE будет выключен на $RESTART_DELAY сек."
+    say "Если SSH подключён через этот туннель, соединение может временно прерваться."
+    say "Проверки ping, порог ошибок и cooldown при этом действии не используются."
+    confirm "Принудительно перезапустить $WG_INTERFACE?" || {
+        result_card cancelled "Интерфейс $WG_INTERFACE не перезапускался."
+        return 0
+    }
+    begin_maintenance || return 0
+    MANAGER_RECOVERY_INTERFACE=$WG_INTERFACE
+    MANAGER_INTERFACE_NEEDS_UP=yes
+    if ! "$NDMC_BIN" -c "interface $WG_INTERFACE down" >/dev/null 2>&1; then
+        MANAGER_INTERFACE_NEEDS_UP=no
+        end_maintenance
+        result_card error "Не удалось выключить $WG_INTERFACE."
+        return 1
+    fi
+    "$SLEEP_BIN" "$RESTART_DELAY"
+    if ! "$NDMC_BIN" -c "interface $WG_INTERFACE up" >/dev/null 2>&1; then
+        "$NDMC_BIN" -c "interface $WG_INTERFACE up" >/dev/null 2>&1 || true
+        MANAGER_INTERFACE_NEEDS_UP=no
+        end_maintenance
+        result_card error "Не удалось включить $WG_INTERFACE." \
+            "Выполнена повторная попытка; проверьте интерфейс вручную."
+        return 1
+    fi
+    MANAGER_INTERFACE_NEEDS_UP=no
+    end_maintenance
+    result_card success "Интерфейс $WG_INTERFACE перезапущен." \
+        "Пауза между выключением и включением: $RESTART_DELAY сек."
 }
 
 remove_managed_cron() {
@@ -1737,16 +1768,18 @@ show_header() {
     say ""
 }
 
-show_detected_interfaces() {
+show_interface_index() {
     detect_interfaces
+    make_temp interfaces
+    INTERFACE_INDEX=$REPLY
+    INTERFACE_COUNT=0
     say "WireGuard-интерфейсы:"
-    if [ -z "$INTERFACE_LIST" ]; then
-        say "  Не найдены. При добавлении задания имя можно будет ввести вручную."
-        return 0
-    fi
     while IFS="$(printf '\t')" read -r iface description; do
+        [ -n "$iface" ] || continue
+        INTERFACE_COUNT=$((INTERFACE_COUNT + 1))
+        printf '%s\n' "$iface" >> "$INTERFACE_INDEX"
         interface_color=$COLOR_GRAY
-        interface_line="  $iface — $description"
+        interface_line="  $INTERFACE_COUNT) $iface — $description"
         interface_config="$CONFIG_DIR/$iface.conf"
         if [ -f "$interface_config" ]; then
             if ! load_config "$interface_config" "$iface"; then
@@ -1758,10 +1791,10 @@ show_detected_interfaces() {
             if [ "$JOB_ID" = "$iface" ] && [ "$WG_INTERFACE" = "$iface" ]; then
                 if [ "$ENABLED" = yes ]; then
                     interface_color=$COLOR_GREEN
-                    interface_line="  $iface — $description · включена"
+                    interface_line="  $INTERFACE_COUNT) $iface — $description · включена"
                 else
                     interface_color=$COLOR_RED
-                    interface_line="  $iface — $description · выключена"
+                    interface_line="  $INTERFACE_COUNT) $iface — $description · выключена"
                 fi
             fi
         fi
@@ -1769,6 +1802,33 @@ show_detected_interfaces() {
     done <<EOF
 $INTERFACE_LIST
 EOF
+
+    for interface_config in "$CONFIG_DIR"/*.conf; do
+        [ -f "$interface_config" ] || continue
+        iface=${interface_config##*/}
+        iface=${iface%.conf}
+        valid_interface "$iface" || continue
+        grep -Fx "$iface" "$INTERFACE_INDEX" >/dev/null 2>&1 && continue
+        INTERFACE_COUNT=$((INTERFACE_COUNT + 1))
+        printf '%s\n' "$iface" >> "$INTERFACE_INDEX"
+        if load_config "$interface_config" "$iface" && \
+           [ "$JOB_ID" = "$iface" ] && [ "$WG_INTERFACE" = "$iface" ]; then
+            if [ "$ENABLED" = yes ]; then
+                interface_color=$COLOR_YELLOW
+                state="включена"
+            else
+                interface_color=$COLOR_RED
+                state="выключена"
+            fi
+            say "${interface_color}  $INTERFACE_COUNT) $iface — интерфейс не найден · $state${COLOR_RESET}"
+        else
+            say "${COLOR_RED}  $INTERFACE_COUNT) $iface — интерфейс не найден · настройки повреждены${COLOR_RESET}"
+        fi
+    done
+
+    if [ "$INTERFACE_COUNT" -eq 0 ]; then
+        say "  Не найдены. Интерфейс можно указать вручную."
+    fi
 }
 
 show_update_menu_item() {
@@ -1777,6 +1837,98 @@ show_update_menu_item() {
     else
         say "  $1) Проверить обновления"
     fi
+}
+
+interface_menu() {
+    selected_interface=$1
+    while :; do
+        cleanup
+        if [ "$UI_ACTIVE" = yes ]; then ui_clear; fi
+        show_header
+        detect_interfaces
+        interface_description "$selected_interface"
+        selected_description=$REPLY
+        say ""
+        say "Интерфейс: $selected_interface — $selected_description"
+        selected_config="$CONFIG_DIR/$selected_interface.conf"
+        configured=no
+        damaged=no
+        if [ -f "$selected_config" ]; then
+            if load_config "$selected_config" "$selected_interface" && \
+               [ "$JOB_ID" = "$selected_interface" ] && \
+               [ "$WG_INTERFACE" = "$selected_interface" ]; then
+                configured=yes
+                if [ "$ENABLED" = yes ]; then
+                    say "Watchdog: ${COLOR_GREEN}включён${COLOR_RESET} · сервер $WG_SERVER_TUNNEL_IP · каждые $CHECK_INTERVAL мин."
+                    toggle_label="Выключить watchdog"
+                else
+                    say "Watchdog: ${COLOR_RED}выключен${COLOR_RESET} · сервер $WG_SERVER_TUNNEL_IP · каждые $CHECK_INTERVAL мин."
+                    toggle_label="Включить watchdog"
+                fi
+            else
+                damaged=yes
+                say "Watchdog: ${COLOR_RED}настройки повреждены${COLOR_RESET}"
+            fi
+        else
+            say "Watchdog: ${COLOR_GRAY}не настроен${COLOR_RESET}"
+        fi
+        say ""
+        say "Действия:"
+        if [ "$configured" = yes ]; then
+            say "  1) Запустить проверку сейчас"
+            say "  2) Показать подробный статус"
+            say "  3) Показать последние события"
+            say "  4) $toggle_label"
+            say "  5) Изменить настройки"
+            say "  6) Принудительно перезапустить интерфейс"
+            say "  7) Удалить задание watchdog"
+        elif [ "$damaged" = yes ]; then
+            say "  1) Удалить повреждённое задание watchdog"
+        else
+            say "  1) Настроить watchdog"
+        fi
+        say "  0) Назад"
+        read_answer "Выберите действие" "0"
+        interface_action=$REPLY
+        [ "$interface_action" = 0 ] && return 0
+        if [ "$UI_ACTIVE" = yes ]; then
+            ui_clear
+            show_header
+            say ""
+            say "Интерфейс: $selected_interface — $selected_description"
+            say ""
+        fi
+        ACTION_PAUSE=yes
+        if [ "$configured" = yes ]; then
+            case "$interface_action" in
+                1) run_job_now "$selected_interface" ;;
+                2) show_job_status "$selected_interface" ;;
+                3) show_job_events "$selected_interface" ;;
+                4) toggle_job "$selected_interface" ;;
+                5) configure_job edit "$selected_interface" ;;
+                6) force_restart_job "$selected_interface" ;;
+                7) delete_job "$selected_interface" ;;
+                *) say "Неизвестный пункт меню." ;;
+            esac
+        elif [ "$damaged" = yes ]; then
+            case "$interface_action" in
+                1)
+                    confirm "Удалить повреждённое задание $selected_interface?" && {
+                        rm -f "$selected_config" || die "не удалось удалить повреждённое задание"
+                        rewrite_crontab || die "задание удалено, но cron не обновлён"
+                        result_card success "Повреждённое задание $selected_interface удалено."
+                    }
+                    ;;
+                *) say "Неизвестный пункт меню." ;;
+            esac
+        else
+            case "$interface_action" in
+                1) configure_job add "$selected_interface" ;;
+                *) say "Неизвестный пункт меню." ;;
+            esac
+        fi
+        [ "$ACTION_PAUSE" = yes ] && ui_pause
+    done
 }
 
 main_menu() {
@@ -1790,60 +1942,39 @@ main_menu() {
             fi
             say ""
         fi
-        build_job_index quiet
-        show_detected_interfaces
+        show_interface_index
         say ""
-        say "Действия:"
-        if [ "$JOB_COUNT" -eq 0 ]; then
-            say "  1) Добавить задание"
-            show_update_menu_item 2
-            say "  3) Удалить WG Watchdog"
-            say "  0) Выход"
+        say "Общие действия:"
+        if [ "$INTERFACE_COUNT" -eq 0 ]; then
+            manual_action=1
+            update_action=2
+            uninstall_action=3
+            say "  $manual_action) Настроить интерфейс вручную"
         else
-            say "  1) Добавить задание"
-            say "  2) Изменить задание"
-            say "  3) Включить/выключить задание"
-            say "  4) Запустить проверку сейчас"
-            say "  5) Показать подробный статус"
-            say "  6) Удалить задание"
-            show_update_menu_item 7
-            say "  8) Удалить WG Watchdog"
-            say "  0) Выход"
+            manual_action=0
+            update_action=$((INTERFACE_COUNT + 1))
+            uninstall_action=$((INTERFACE_COUNT + 2))
         fi
-        read_answer "Выберите действие" "0"
-        if [ "$REPLY" != 0 ] && [ "$UI_ACTIVE" = yes ]; then
-            # Preserve the selected action while repainting the action screen.
-            menu_action=$REPLY
-            ui_clear
-            show_header
-            REPLY=$menu_action
-        fi
-        if [ "$JOB_COUNT" -eq 0 ]; then
-            case "$REPLY" in
-                1) configure_job add "" ;;
-                2) perform_update ;;
-                3) uninstall_program ;;
-                0) return 0 ;;
-                *) say "Неизвестный пункт меню." ;;
-            esac
-            ui_pause
-            continue
-        fi
+        show_update_menu_item "$update_action"
+        say "  $uninstall_action) Удалить WG Watchdog"
+        say "  0) Выход"
+        read_answer "Выберите интерфейс или действие" "0"
+        menu_action=$REPLY
+        [ "$menu_action" = 0 ] && return 0
         ACTION_PAUSE=yes
-        case "$REPLY" in
-            1) configure_job add "" ;;
-            2)
-                if select_job "Какое задание изменить"; then configure_job edit "$SELECTED_JOB"; fi
-                ;;
-            3) toggle_job ;;
-            4) run_job_now ;;
-            5) show_job_status ;;
-            6) delete_job ;;
-            7) perform_update ;;
-            8) uninstall_program ;;
-            0) return 0 ;;
-            *) say "Неизвестный пункт меню." ;;
-        esac
+        if is_positive_integer "$menu_action" && [ "$menu_action" -le "$INTERFACE_COUNT" ]; then
+            selected_interface=$(sed -n "${menu_action}p" "$INTERFACE_INDEX")
+            interface_menu "$selected_interface"
+            ACTION_PAUSE=no
+        elif [ "$manual_action" -ne 0 ] && [ "$menu_action" = "$manual_action" ]; then
+            configure_job add ""
+        elif [ "$menu_action" = "$update_action" ]; then
+            perform_update
+        elif [ "$menu_action" = "$uninstall_action" ]; then
+            uninstall_program
+        else
+            say "Неизвестный пункт меню."
+        fi
         [ "$ACTION_PAUSE" = yes ] && ui_pause
     done
 }

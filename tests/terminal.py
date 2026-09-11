@@ -58,11 +58,11 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
         os.close(slave)
         output = bytearray()
         sent = False
-        prompts_answered = 0
-        job_prompts_answered = 0
+        main_prompts_answered = 0
+        action_prompts_answered = 0
         pages_answered = 0
-        pending_actions = list(actions or ["0"])
-        pending_job_answers = list(job_answers or [])
+        pending_main_answers = list(actions or ["0"])
+        pending_action_answers = list(job_answers or [])
         deadline = time.monotonic() + 10
         try:
             while time.monotonic() < deadline:
@@ -75,27 +75,28 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                     if not chunk:
                         break
                     output.extend(chunk)
-                    prompts_seen = output.count("Выберите действие".encode())
-                    job_prompts_seen = (
-                        output.count("Выберите задание".encode())
-                        + output.count("Какое задание".encode())
+                    main_prompts_seen = output.count(
+                        "Выберите интерфейс".encode()
                     )
+                    action_prompts_seen = output.count("Выберите действие".encode())
                     pages_seen = output.count("Нажмите Enter, чтобы продолжить".encode())
-                    if job_prompts_seen > job_prompts_answered:
-                        job_prompts_answered = job_prompts_seen
-                        os.write(master, (pending_job_answers.pop(0) + "\n").encode())
-                    elif prompts_seen > prompts_answered:
-                        prompts_answered = prompts_seen
+                    if action_prompts_seen > action_prompts_answered:
+                        action_prompts_answered = action_prompts_seen
+                        os.write(master, (pending_action_answers.pop(0) + "\n").encode())
+                    elif main_prompts_seen > main_prompts_answered:
+                        main_prompts_answered = main_prompts_seen
                         if terminate:
                             process.send_signal(signal.SIGTERM)
                         else:
-                            os.write(master, (pending_actions.pop(0) + "\n").encode())
+                            os.write(master, (pending_main_answers.pop(0) + "\n").encode())
                         sent = True
                     elif pages_seen > pages_answered:
                         pages_answered = pages_seen
                         os.write(master, b"\n")
                 if process.poll() is not None and not ready:
                     break
+            if process.poll() is None:
+                raise AssertionError(output.decode(errors="replace"))
             process.wait(timeout=2)
             assert sent, output.decode(errors="replace")
             assert process.returncode == (143 if terminate else 0), output
@@ -111,14 +112,14 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
             assert "Wireguard3".encode() in output, "Показаны не все интерфейсы"
             assert "Два пира".encode() in output, "Не показано описание последнего интерфейса"
             if job_answers:
-                assert "Настроенные задания:".encode() in output
-                assert "0) Вернуться в главное меню".encode() in output
-                assert "Выберите задание [1]".encode() not in output
+                assert "Интерфейс: Wireguard".encode() in output
+                assert "0) Назад".encode() in output
+                assert "Какое задание".encode() not in output
             if disabled_jobs:
                 assert b"\x1b[1;31m" in output, "Отключённое задание не выделено красным"
             if update_available:
                 green_update = re.compile(
-                    rb"\x1b\[1;32m\s*2\)\s+" +
+                    rb"\x1b\[1;32m\s*\d+\)\s+" +
                     "Обновить программу до версии 9.9.9".encode()
                 )
                 assert green_update.search(output), \

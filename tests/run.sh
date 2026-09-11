@@ -574,6 +574,20 @@ assert_contains "$DIALOG_ROOT/output" 'Изменить эти значения 
 assert_contains "$DIALOG_ROOT/output" 'фиксированный локальный порт WireGuard: 16669' "предупреждение listen-port"
 pass "новое задание получает рекомендуемые параметры без лишних вопросов"
 
+# Выбор интерфейса в главном меню передаётся в настройку без второго вопроса.
+(
+    prepare_dialog_case manager-context-add
+    printf '\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job add Wireguard2 > "$DIALOG_ROOT/output"
+    assert_contains "$CONFIG_DIR/Wireguard2.conf" "WG_INTERFACE='Wireguard2'" "интерфейс контекстного задания"
+    assert_contains "$CONFIG_DIR/Wireguard2.conf" "WG_SERVER_TUNNEL_IP='10.2.0.1'" "адрес выбранного интерфейса"
+    if grep -F 'Выберите номер интерфейса' "$OUTPUT_DEVICE" >/dev/null; then
+        fail "после выбора интерфейса он запрошен повторно"
+    fi
+)
+pass "создание задания использует выбранный интерфейс без повторного вопроса"
+
 # Полноэкранный режим начинает раздел публичной проверки с новой страницы,
 # чтобы пояснение и вопрос не разделялись автоматической очисткой экрана.
 (
@@ -695,22 +709,6 @@ fi
 assert_contains "$CRONTAB_PATH.wg-watchdog.bak" 'Wireguard9' "резервная копия cron"
 pass "crontab сохраняет чужие строки и исключает отключённые задания"
 
-# Включённые и выключенные задания имеют разные цвета и номер с точкой.
-COLOR_GREEN='<GREEN>'
-COLOR_RED='<RED>'
-COLOR_RESET='</GREEN>'
-NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
-build_job_index > "$MANAGER_ROOT/job-list"
-assert_contains "$MANAGER_ROOT/job-list" '<GREEN>1. Wireguard0' "формат номера задания"
-assert_contains "$MANAGER_ROOT/job-list" '<RED>2. Wireguard1' "цвет выключенного задания"
-if grep -F '<GREEN>1) Wireguard0' "$MANAGER_ROOT/job-list" >/dev/null; then
-    fail "задание использует тот же формат номера, что и действие меню"
-fi
-COLOR_GREEN=''
-COLOR_RED=''
-COLOR_RESET=''
-pass "состояния заданий различаются цветом и нумеруются с точкой"
-
 # Итоги действий имеют один компактный формат для успеха, ошибки и отмены.
 COLOR_GREEN='<GREEN>'
 COLOR_RED='<RED>'
@@ -734,26 +732,96 @@ COLOR_YELLOW=''
 COLOR_RESET=''
 pass "результаты действий и предупреждения используют единый формат"
 
-# Каждый пункт, работающий с заданием, показывает список без выбора по Enter и позволяет вернуться.
-ACTION_ROOT="$TEST_ROOT/job-actions"
+# После выбора интерфейса действия выполняются в его контексте без повторного выбора задания.
+ACTION_ROOT="$TEST_ROOT/interface-actions"
 mkdir -p "$ACTION_ROOT"
-for menu_action in 2 3 4 5 6; do
-    printf '%s\n\n0\n0\n' "$menu_action" > "$ACTION_ROOT/input"
-    INPUT_DEVICE="$ACTION_ROOT/input"
-    OUTPUT_DEVICE="$ACTION_ROOT/prompts"
-    open_console
-    if ! main_menu > "$ACTION_ROOT/output-$menu_action"; then
-        fail "пункт $menu_action не вернулся в главное меню"
-    fi
-    assert_contains "$ACTION_ROOT/output-$menu_action" '1. Wireguard0' "список задания для пункта $menu_action"
-    assert_contains "$ACTION_ROOT/output-$menu_action" '0) Вернуться в главное меню' "возврат из пункта $menu_action"
-    assert_contains "$ACTION_ROOT/output-$menu_action" 'Введите номер от 1 до 2 или 0 для возврата.' "Enter без значения для пункта $menu_action"
-    if grep -F 'Какое задание' "$OUTPUT_DEVICE" | grep -F '[1]' >/dev/null 2>&1 || \
-       grep -F 'Выберите задание [1]' "$OUTPUT_DEVICE" >/dev/null 2>&1; then
-        fail "в пункте $menu_action осталось задание по умолчанию"
-    fi
+printf '0\n' > "$ACTION_ROOT/input"
+INPUT_DEVICE="$ACTION_ROOT/input"
+OUTPUT_DEVICE="$ACTION_ROOT/prompts"
+open_console
+interface_menu Wireguard0 > "$ACTION_ROOT/configured"
+assert_contains "$ACTION_ROOT/configured" 'Интерфейс: Wireguard0 — Удалённый офис' "контекст интерфейса"
+assert_contains "$ACTION_ROOT/configured" '1) Запустить проверку сейчас' "ручная проверка"
+assert_contains "$ACTION_ROOT/configured" '3) Показать последние события' "просмотр событий"
+assert_contains "$ACTION_ROOT/configured" '6) Принудительно перезапустить интерфейс' "ручной restart"
+assert_contains "$ACTION_ROOT/configured" '7) Удалить задание watchdog' "удаление задания"
+assert_contains "$ACTION_ROOT/configured" '0) Назад' "возврат из интерфейса"
+if grep -F 'Какое задание' "$OUTPUT_DEVICE" >/dev/null 2>&1; then
+    fail "контекстное меню повторно запрашивает задание"
+fi
+printf '0\n' > "$ACTION_ROOT/input-unconfigured"
+INPUT_DEVICE="$ACTION_ROOT/input-unconfigured"
+OUTPUT_DEVICE="$ACTION_ROOT/prompts-unconfigured"
+open_console
+interface_menu Wireguard3 > "$ACTION_ROOT/unconfigured"
+assert_contains "$ACTION_ROOT/unconfigured" 'Watchdog: не настроен' "ненастроенный интерфейс"
+assert_contains "$ACTION_ROOT/unconfigured" '1) Настроить watchdog' "создание задания в контексте"
+if grep -F 'Изменить настройки' "$ACTION_ROOT/unconfigured" >/dev/null; then
+    fail "для ненастроенного интерфейса показаны лишние действия"
+fi
+pass "действия сгруппированы в контекстном меню интерфейса"
+
+# События читаются из журнала KeeneticOS, фильтруются по заданию и не пишутся на /opt.
+cat > "$ACTION_ROOT/ndmc-events" <<'EOF'
+#!/bin/sh
+i=1
+while [ "$i" -le 25 ]; do
+    printf 'Sep 10 wg-watchdog: [Wireguard0] событие %s\n' "$i"
+    i=$((i + 1))
 done
-pass "все действия показывают задания, не выбирают первое по Enter и имеют возврат"
+printf 'Sep 10 wg-watchdog: [Wireguard1] чужое событие\n'
+printf 'Sep 10 system: [Wireguard0] не watchdog\n'
+EOF
+chmod 755 "$ACTION_ROOT/ndmc-events"
+NDMC_BIN="$ACTION_ROOT/ndmc-events"
+TMP_DIR="$MANAGER_ROOT/tmp"
+show_job_events Wireguard0 > "$ACTION_ROOT/events"
+assert_contains "$ACTION_ROOT/events" 'событие 6' "первая из последних двадцати записей"
+assert_contains "$ACTION_ROOT/events" 'событие 25' "последняя запись"
+if grep -F 'событие 5' "$ACTION_ROOT/events" >/dev/null || \
+   grep -F 'чужое событие' "$ACTION_ROOT/events" >/dev/null; then
+    fail "журнал не ограничен или содержит другое задание"
+fi
+assert_contains "$ACTION_ROOT/events" 'отдельный файл журнала не создаётся' "бережное логирование"
+pass "последние события фильтруются из системного журнала без записи на флеш"
+
+# Принудительный restart использует паузу задания и всегда пытается вернуть интерфейс в up.
+cat > "$ACTION_ROOT/ndmc-restart" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$MOCK_RESTART_LOG"
+EOF
+chmod 755 "$ACTION_ROOT/ndmc-restart"
+: > "$ACTION_ROOT/restart.log"
+NDMC_BIN="$ACTION_ROOT/ndmc-restart"
+MOCK_RESTART_LOG="$ACTION_ROOT/restart.log"
+export MOCK_RESTART_LOG
+SLEEP_BIN=/bin/true
+RUN_DIR="$MANAGER_ROOT/run"
+STATE_DIR="$MANAGER_ROOT/state"
+CONFIG_DIR="$MANAGER_ROOT/config"
+printf 'yes\n' > "$ACTION_ROOT/restart-answer"
+INPUT_DEVICE="$ACTION_ROOT/restart-answer"
+OUTPUT_DEVICE="$ACTION_ROOT/restart-prompt"
+open_console
+force_restart_job Wireguard0 > "$ACTION_ROOT/restart-output"
+assert_contains "$ACTION_ROOT/restart.log" '-c interface Wireguard0 down' "выключение интерфейса"
+assert_contains "$ACTION_ROOT/restart.log" '-c interface Wireguard0 up' "включение интерфейса"
+assert_contains "$ACTION_ROOT/restart-output" 'Интерфейс Wireguard0 перезапущен' "итог restart"
+[ ! -d "$RUN_DIR/maintenance.lock" ] || fail "после restart осталась блокировка обслуживания"
+pass "принудительный restart подтверждается и возвращает интерфейс в up"
+
+: > "$ACTION_ROOT/restart.log"
+printf 'n\n' > "$ACTION_ROOT/restart-cancel-answer"
+INPUT_DEVICE="$ACTION_ROOT/restart-cancel-answer"
+OUTPUT_DEVICE="$ACTION_ROOT/restart-cancel-prompt"
+open_console
+force_restart_job Wireguard0 > "$ACTION_ROOT/restart-cancel-output"
+assert_empty "$ACTION_ROOT/restart.log" "отмена принудительного restart"
+assert_contains "$ACTION_ROOT/restart-cancel-output" 'не перезапускался' "результат отмены restart"
+pass "принудительный restart безопасно отменяется по умолчанию"
+
+NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
+SLEEP_BIN=sleep
 
 # Повторная сборка идентичного crontab не меняет файл и резервную копию.
 cron_inode_before=$(ls -i "$CRONTAB_PATH" | awk '{ print $1 }')
@@ -844,15 +912,15 @@ EOF
     COLOR_RED='<RED>'
     COLOR_GRAY='<GRAY>'
     COLOR_RESET='</COLOR>'
-    show_detected_interfaces > "$TEST_ROOT/interfaces"
+    show_interface_index > "$TEST_ROOT/interfaces"
 )
 assert_contains "$TEST_ROOT/interfaces" 'WireGuard-интерфейсы:' "заголовок интерфейсов"
-assert_contains "$TEST_ROOT/interfaces" '<GREEN>  Wireguard0 — Удалённый офис · включена' "включённый интерфейс"
-assert_contains "$TEST_ROOT/interfaces" '<RED>  Wireguard2 — без описания · выключена' "выключенный интерфейс"
-assert_contains "$TEST_ROOT/interfaces" '<GRAY>  Wireguard3 — Два пира</COLOR>' "ненастроенный интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<GREEN>  1) Wireguard0 — Удалённый офис · включена' "включённый интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<RED>  2) Wireguard2 — без описания · выключена' "выключенный интерфейс"
+assert_contains "$TEST_ROOT/interfaces" '<GRAY>  3) Wireguard3 — Два пира</COLOR>' "ненастроенный интерфейс"
 pass "все интерфейсы показываются со статусом и цветом проверки"
 
-# Набор действий зависит от наличия настроенных заданий.
+# Основное меню выбирает интерфейс, а управление программой оставляет отдельным блоком.
 MENU_ROOT="$TEST_ROOT/menu"
 mkdir -p "$MENU_ROOT/empty" "$MENU_ROOT/tmp"
 CONFIG_DIR="$MENU_ROOT/empty"
@@ -863,12 +931,10 @@ OUTPUT_DEVICE="$MENU_ROOT/prompts-empty"
 open_console
 UPDATE_AVAILABLE=no
 main_menu > "$MENU_ROOT/menu-empty"
-assert_contains "$MENU_ROOT/menu-empty" '1) Добавить задание' "добавление без заданий"
-assert_contains "$MENU_ROOT/menu-empty" '2) Проверить обновления' "обновление без заданий"
-assert_contains "$MENU_ROOT/menu-empty" '3) Удалить WG Watchdog' "удаление без заданий"
-if grep -F 'Изменить задание' "$MENU_ROOT/menu-empty" >/dev/null; then
-    fail "без заданий показано полное меню"
-fi
+assert_contains "$MENU_ROOT/menu-empty" '1) Wireguard0 — Удалённый офис' "выбор первого интерфейса"
+assert_contains "$MENU_ROOT/menu-empty" '4) Проверить обновления' "обновление после интерфейсов"
+assert_contains "$MENU_ROOT/menu-empty" '5) Удалить WG Watchdog' "удаление программы"
+assert_contains "$MENU_ROOT/menu-empty" '0) Выход' "выход из программы"
 
 CONFIG_DIR="$MANAGER_ROOT/config"
 TMP_DIR="$MANAGER_ROOT/tmp"
@@ -877,10 +943,13 @@ INPUT_DEVICE="$MENU_ROOT/input-full"
 OUTPUT_DEVICE="$MENU_ROOT/prompts-full"
 open_console
 main_menu > "$MENU_ROOT/menu-full"
-assert_contains "$MENU_ROOT/menu-full" '2) Изменить задание' "полное меню"
-assert_contains "$MENU_ROOT/menu-full" '7) Проверить обновления' "обновление в полном меню"
-assert_contains "$MENU_ROOT/menu-full" '8) Удалить WG Watchdog' "удаление в полном меню"
-pass "меню сокращается, когда заданий ещё нет"
+assert_contains "$MENU_ROOT/menu-full" '1) Wireguard0 — Удалённый офис · включена' "статус в главном меню"
+assert_contains "$MENU_ROOT/menu-full" '4) Wireguard1 — интерфейс не найден · выключена' "недоступное настроенное задание"
+assert_contains "$MENU_ROOT/menu-full" '5) Проверить обновления' "общее обновление"
+if grep -F 'Запустить проверку сейчас' "$MENU_ROOT/menu-full" >/dev/null; then
+    fail "действие интерфейса осталось в основном меню"
+fi
+pass "основное меню разделяет интерфейсы и общие действия"
 
 # Менеджер запускается без лишнего подтверждения, а установщик не стартует его после первой установки.
 if grep -F 'confirm_yes "Продолжить?' "$MANAGER" >/dev/null; then
@@ -1187,7 +1256,7 @@ pass "временные файлы уникальны, закрыты и кор
     printf '1\n\n\n' > "$INPUT_DEVICE"
     open_console
     configure_job add "" >/dev/null
-    printf '6\n1\nn\n0\n' > "$INPUT_DEVICE"
+    printf '1\n7\nn\n0\n0\n' > "$INPUT_DEVICE"
     open_console
     main_menu > "$DIALOG_ROOT/cancel-output"
     [ -f "$CONFIG_DIR/Wireguard0.conf" ] || fail "отмена удалила задание"
@@ -1617,12 +1686,8 @@ pass "найденное обновление перепроверяется и 
 
 # KeeneticOS предоставляет системный журнал через ndmc, а не OpenWrt logread.
 (
-    select_job() {
-        SELECTED_JOB=Wireguard0
-        return 0
-    }
     run_visible() { return 0; }
-    run_job_now > "$TEST_ROOT/manual-check-result"
+    run_job_now Wireguard0 > "$TEST_ROOT/manual-check-result"
     assert_contains "$TEST_ROOT/manual-check-result" "ndmc -c 'show log' | grep wg-watchdog" "команда журнала Keenetic"
 )
 if grep -F 'logread' "$MANAGER" "$REPO_DIR/docs/keenetic-acceptance.md" >/dev/null 2>&1; then
