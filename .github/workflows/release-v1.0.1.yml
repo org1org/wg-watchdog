@@ -14,13 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0
 
       - name: Verify release
         env:
           TARGET_SHA: 2425fb775c4a72984fef8e4cc8a6365973be4072
         run: |
-          test "$(git rev-parse HEAD^)" = "$TARGET_SHA"
+          git merge-base --is-ancestor "$TARGET_SHA" HEAD
+          git diff --quiet "$TARGET_SHA" HEAD -- . \
+            ':(exclude).github/workflows/release-v1.0.1.yml'
           test "$(sed -n 's/^VERSION=//p' RELEASE)" = "1.0.1"
           test "$(sed -n 's/^COMMIT=//p' RELEASE)" = "9176eced9765cc99cef9a6263f3b1cbc0c12b4a0"
           printf '%s  %s\n' \
