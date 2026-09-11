@@ -1,14 +1,11 @@
 #!/bin/sh
 
-# Interactive job manager for WG Watchdog.
+# Interactive WireGuard watchdog manager for KeeneticOS.
 
-VERSION="1.8.5"
+VERSION="1.0.0"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
-WATCHDOG_URL="$BASE_URL/wg-watchdog.sh"
-MANAGER_URL="$BASE_URL/wg-watchdog-manager.sh"
-VERSION_URL="$BASE_URL/VERSION"
 RELEASE_MANIFEST_URL="${WG_WATCHDOG_RELEASE_MANIFEST_URL:-$BASE_URL/RELEASE}"
 OPT_ROOT="${WG_WATCHDOG_OPT_ROOT:-/opt}"
 WATCHDOG_PATH="$OPT_ROOT/bin/wg-watchdog.sh"
@@ -19,7 +16,6 @@ STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
 UPDATE_DIR="${WG_WATCHDOG_UPDATE_DIR:-$OPT_ROOT/bin/.wg-watchdog-update}"
 TMP_DIR="${WG_WATCHDOG_TMP_DIR:-/tmp}"
-LEGACY_CONFIG="$OPT_ROOT/etc/wg-watchdog.conf"
 CRONTAB_PATH="$OPT_ROOT/etc/crontab"
 CRON_INIT="$OPT_ROOT/etc/init.d/S10cron"
 NDMC_BIN="${WG_WATCHDOG_NDMC:-ndmc}"
@@ -728,7 +724,7 @@ install_program_files() {
     tmp_manager=$REPLY
 
     target_version=${REMOTE_VERSION:-$VERSION}
-    info "Загружаю файлы WG Watchdog версии $target_version..."
+    info "Загружаю файлы WG Watchdog Manager версии $target_version..."
     release_url="$RAW_REPOSITORY_URL/$REMOTE_COMMIT"
     download_file "$release_url/wg-watchdog.sh" "$tmp_watchdog" || {
         say "Ошибка обновления: не удалось загрузить watchdog."
@@ -1196,47 +1192,7 @@ rewrite_crontab() (
     "$PIDOF_BIN" cron >/dev/null 2>&1 || die "процесс cron не запущен"
 )
 
-cleanup_legacy_state() {
-    legacy_state_dir="/opt/var/lib/wg-watchdog"
-    [ -d "$legacy_state_dir" ] || return 0
-    removed=no
-    for state_file in "$legacy_state_dir"/*.state; do
-        [ -f "$state_file" ] || continue
-        rm -f "$state_file"
-        removed=yes
-    done
-    rmdir "$legacy_state_dir" 2>/dev/null || true
-    if [ "$removed" = "yes" ]; then
-        say "Старые файлы состояния удалены из /opt: теперь состояние хранится в RAM."
-    fi
-}
-
-migrate_legacy_config() {
-    [ -f "$LEGACY_CONFIG" ] || return 0
-    existing_count=$(find "$CONFIG_DIR" -type f -name '*.conf' 2>/dev/null | wc -l)
-    [ "$existing_count" -eq 0 ] || return 0
-
-    if ! load_config "$LEGACY_CONFIG"; then
-        warn "Старая конфигурация имеет недопустимый формат."
-        return 0
-    fi
-    normalize_parameters "" || die "внутренняя ошибка схемы параметров"
-    if valid_interface "$WG_INTERFACE" && valid_address "$WG_SERVER_TUNNEL_IP"; then
-        JOB_ID=$WG_INTERFACE
-        INTERNET_CHECK=yes
-        INTERNET_CHECK_TARGET_1=1.1.1.1
-        INTERNET_CHECK_TARGET_2=8.8.8.8
-        WG_SERVER_PUBLIC_IP=""
-        ENABLED=yes
-        write_config
-        mv "$LEGACY_CONFIG" "$LEGACY_CONFIG.migrated-v1.0.0"
-        say "Конфигурация v1.0.0 перенесена в актуальный формат."
-    else
-        warn "Старую конфигурацию не удалось перенести автоматически."
-    fi
-}
-
-upgrade_config_files() {
+normalize_config_files() {
     for config_file in "$CONFIG_DIR"/*.conf; do
         [ -f "$config_file" ] || continue
         config_name=${config_file##*/}
@@ -1250,8 +1206,7 @@ upgrade_config_files() {
         valid_address "$WG_SERVER_TUNNEL_IP" || continue
         normalize_parameters "$JOB_ID" || die "внутренняя ошибка схемы параметров"
         WG_SERVER_PUBLIC_IP=${WG_SERVER_PUBLIC_IP:-}
-        # Jobs created before v1.7.0 keep their former external-network gate.
-        case "${INTERNET_CHECK:-}" in yes|no) ;; *) INTERNET_CHECK=yes ;; esac
+        case "${INTERNET_CHECK:-}" in yes|no) ;; *) INTERNET_CHECK=no ;; esac
         INTERNET_CHECK_TARGET_1=${INTERNET_CHECK_TARGET_1:-1.1.1.1}
         INTERNET_CHECK_TARGET_2=${INTERNET_CHECK_TARGET_2:-8.8.8.8}
         if ! valid_address "$INTERNET_CHECK_TARGET_1"; then
@@ -1702,13 +1657,13 @@ uninstall_program() {
     if [ "$uninstall_mode" = keep ]; then
         say "Конфигурации останутся в $CONFIG_DIR и будут подхвачены после переустановки."
         confirm "Удалить программу и сохранить задания?" || {
-            result_card cancelled "WG Watchdog и задания сохранены без изменений."
+            result_card cancelled "WG Watchdog Manager и задания сохранены без изменений."
             return 0
         }
     else
         say "Настройки заданий и их состояние будут удалены без возможности восстановления."
         confirm "Удалить программу и все задания?" || {
-            result_card cancelled "WG Watchdog и задания сохранены без изменений."
+            result_card cancelled "WG Watchdog Manager и задания сохранены без изменений."
             return 0
         }
     fi
@@ -1723,7 +1678,6 @@ uninstall_program() {
             valid_interface "$remove_id" || continue
             remove_job_files "$remove_id" || die "удаление не завершено: часть файлов осталась"
         done
-        rm -f "$LEGACY_CONFIG" || die "не удалось удалить прежнюю конфигурацию"
         rmdir "$CONFIG_DIR" 2>/dev/null || true
     else
         for state_file in "$STATE_DIR"/*.state; do
@@ -1745,27 +1699,27 @@ uninstall_program() {
     fi
     ui_stop
     if [ "$uninstall_mode" = keep ]; then
-        say "WG Watchdog удалён. Настроенные задания сохранены в $CONFIG_DIR."
+        say "WG Watchdog Manager удалён. Настроенные задания сохранены в $CONFIG_DIR."
         say "После переустановки они снова появятся в менеджере и cron."
     else
-        say "WG Watchdog и все его задания удалены."
+        say "WG Watchdog Manager и все его задания удалены."
     fi
     say "Сторонние задания cron сохранены."
     exit 0
 }
 
 show_header() {
-    if [ "$UI_ACTIVE" = yes ]; then
-        say "${COLOR_CYAN}WG WATCHDOG  /  $VERSION${COLOR_RESET}"
+    if [ "${1:-compact}" = main ]; then
+        say "${COLOR_CYAN} __      __  ___ __  __${COLOR_RESET}"
+        say "${COLOR_CYAN} \\ \\ /\\ / / / __|  \\/  |${COLOR_RESET}"
+        say "${COLOR_CYAN}  \\ V  V / | (_ | |\\/| |${COLOR_RESET}"
+        say "${COLOR_CYAN}   \\_/\\_/   \\___|_|  |_|${COLOR_RESET}"
+        say "${COLOR_CYAN}      WATCHDOG MANAGER${COLOR_RESET}"
+        say "Контроль WireGuard · Версия $VERSION · Автор: $AUTHOR"
+    else
+        say "${COLOR_CYAN}WG Watchdog Manager  /  $VERSION${COLOR_RESET}"
         say "Автор: $AUTHOR · Контроль WireGuard"
-        return 0
     fi
-    say ""
-    printf '%s%s%s\n' "$COLOR_CYAN" 'WG Watchdog Manager' "$COLOR_RESET"
-    say "Контролирует доступность WG-сервера и автоматически перезапускает"
-    say "зависшие WireGuard-интерфейсы. Поддерживает отдельное задание для каждого интерфейса."
-    say "Автор: $AUTHOR    Версия: $VERSION"
-    say ""
 }
 
 show_interface_index() {
@@ -1934,14 +1888,12 @@ interface_menu() {
 main_menu() {
     while :; do
         cleanup
-        if [ "$UI_ACTIVE" = yes ]; then
-            ui_clear
-            show_header
-            if [ "$UPDATE_AVAILABLE" = yes ]; then
-                say "${COLOR_YELLOW}Доступно обновление: $REMOTE_VERSION${COLOR_RESET}"
-            fi
-            say ""
+        if [ "$UI_ACTIVE" = yes ]; then ui_clear; fi
+        show_header main
+        if [ "$UPDATE_AVAILABLE" = yes ]; then
+            say "${COLOR_YELLOW}Доступно обновление: $REMOTE_VERSION${COLOR_RESET}"
         fi
+        say ""
         show_interface_index
         say ""
         say "Общие действия:"
@@ -1956,7 +1908,7 @@ main_menu() {
             uninstall_action=$((INTERFACE_COUNT + 2))
         fi
         show_update_menu_item "$update_action"
-        say "  $uninstall_action) Удалить WG Watchdog"
+        say "  $uninstall_action) Удалить WG Watchdog Manager"
         say "  0) Выход"
         read_answer "Выберите интерфейс или действие" "0"
         menu_action=$REPLY
@@ -2012,20 +1964,17 @@ if [ "${1:-}" = --repair ]; then
     command -v "$SYNC_BIN" >/dev/null 2>&1 || die "команда sync не найдена"
     fetch_remote_release || die "не удалось загрузить корректный манифест выпуска"
     install_program_files || die "не удалось восстановить программные файлы"
-    say "WG Watchdog $REMOTE_VERSION установлен с проверкой и возможностью отката."
+    say "WG Watchdog Manager $REMOTE_VERSION установлен с проверкой и возможностью отката."
     exit 0
 fi
 rm -f "$RUN_DIR/uninstalled"
-show_header
 ensure_environment
-cleanup_legacy_state
-migrate_legacy_config
-upgrade_config_files
+normalize_config_files
 ensure_short_command
 rewrite_crontab || exit 1
 
 check_update_status
 show_update_notice
 main_menu
-say "Выход из WG Watchdog."
+say "Выход из WG Watchdog Manager."
 exit 0

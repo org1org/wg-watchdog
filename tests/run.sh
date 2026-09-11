@@ -7,7 +7,6 @@ REPO_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
 WATCHDOG="$REPO_DIR/wg-watchdog.sh"
 INSTALLER="$REPO_DIR/install.sh"
 MANAGER="$REPO_DIR/wg-watchdog-manager.sh"
-VERSION_FILE="$REPO_DIR/VERSION"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/wg-watchdog-tests.XXXXXX")
 TEST_NUMBER=0
 PASS_COUNT=0
@@ -637,7 +636,7 @@ configure_job add "" >/dev/null
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP='198.51.100.10'" "публичный Endpoint"
 pass "явный yes включает проверку найденного публичного адреса"
 
-# Обновление конфигурации v1.1 добавляет новые параметры и исправляет неточный cron-интервал.
+# Неполная конфигурация нормализуется безопасными текущими значениями.
 MANAGER_ROOT="$TEST_ROOT/manager"
 CONFIG_DIR="$MANAGER_ROOT/config"
 STATE_DIR="$MANAGER_ROOT/state"
@@ -658,18 +657,18 @@ RESTART_DELAY='3'
 CHECK_INTERVAL='7'
 ENABLED='yes'
 EOF
-upgrade_config_files >/dev/null
-assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "миграция FAILURE_THRESHOLD"
-assert_contains "$CONFIG_DIR/Wireguard0.conf" "RESTART_COOLDOWN='30'" "миграция cooldown"
+normalize_config_files >/dev/null
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "значение FAILURE_THRESHOLD"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "RESTART_COOLDOWN='30'" "значение cooldown"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "CHECK_INTERVAL='5'" "нормализация интервала"
-assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='yes'" "сохранение прежней сетевой логики"
-assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_1='1.1.1.1'" "миграция первого контрольного адреса"
-assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_2='8.8.8.8'" "миграция второго контрольного адреса"
-pass "старая конфигурация обновляется без молчаливой смены сетевой логики"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='no'" "безопасное отключение внешней проверки"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_1='1.1.1.1'" "первый контрольный адрес"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_2='8.8.8.8'" "второй контрольный адрес"
+pass "неполная конфигурация нормализуется безопасно"
 
-# Повторный запуск миграции не перезаписывает неизменившийся файл на /opt.
+# Повторная нормализация не перезаписывает неизменившийся файл на /opt.
 config_inode_before=$(ls -i "$CONFIG_DIR/Wireguard0.conf" | awk '{ print $1 }')
-upgrade_config_files >/dev/null
+normalize_config_files >/dev/null
 config_inode_after=$(ls -i "$CONFIG_DIR/Wireguard0.conf" | awk '{ print $1 }')
 assert_equal "$config_inode_after" "$config_inode_before" "неизменившийся конфиг"
 pass "неизменившаяся конфигурация не перезаписывается"
@@ -838,16 +837,14 @@ assert_contains "$WATCHDOG" 'STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdo
 assert_contains "$WATCHDOG" 'RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"' "RAM lock dir"
 pass "состояние и блокировки по умолчанию размещены в RAM"
 
-# Версии исполняемых файлов должны совпадать. Legacy-файл VERSION намеренно
-# остаётся на 1.5.4, чтобы старый менеджер не запустил последовательное обновление.
-legacy_version=$(sed -n '1p' "$VERSION_FILE")
+# Версии исполняемых файлов должны совпадать.
 manager_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$MANAGER" | head -n 1)
 watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$WATCHDOG" | head -n 1)
 installer_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$INSTALLER" | head -n 1)
 assert_equal "$watchdog_version" "$manager_version" "версия watchdog"
 assert_equal "$installer_version" "$manager_version" "версия установщика"
-assert_equal "$legacy_version" 1.5.4 "защитная версия старого канала обновлений"
-pass "версии исполняемых файлов совпадают, старый канал обновлений заморожен"
+assert_equal "$manager_version" 1.0.0 "номер публичного выпуска"
+pass "версии исполняемых файлов совпадают"
 
 # Семантическое сравнение и строгий манифест выпуска.
 version_is_newer 1.10.0 1.9.9 || fail "1.10.0 не распознана как новая версия"
@@ -900,7 +897,7 @@ COLOR_RESET=''
 show_header > "$TEST_ROOT/header"
 assert_contains "$TEST_ROOT/header" 'WG Watchdog Manager' "заголовок"
 assert_contains "$TEST_ROOT/header" 'Автор: org1org' "автор"
-assert_contains "$TEST_ROOT/header" "Версия: $VERSION" "версия в шапке"
+assert_contains "$TEST_ROOT/header" "/  $VERSION" "версия в шапке"
 NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
 (
     cat > "$CONFIG_DIR/Wireguard2.conf" <<'EOF'
@@ -933,7 +930,7 @@ UPDATE_AVAILABLE=no
 main_menu > "$MENU_ROOT/menu-empty"
 assert_contains "$MENU_ROOT/menu-empty" '1) Wireguard0 — Удалённый офис' "выбор первого интерфейса"
 assert_contains "$MENU_ROOT/menu-empty" '4) Проверить обновления' "обновление после интерфейсов"
-assert_contains "$MENU_ROOT/menu-empty" '5) Удалить WG Watchdog' "удаление программы"
+assert_contains "$MENU_ROOT/menu-empty" '5) Удалить WG Watchdog Manager' "удаление программы"
 assert_contains "$MENU_ROOT/menu-empty" '0) Выход' "выход из программы"
 
 CONFIG_DIR="$MANAGER_ROOT/config"
@@ -955,7 +952,7 @@ pass "основное меню разделяет интерфейсы и об�
 if grep -F 'confirm_yes "Продолжить?' "$MANAGER" >/dev/null; then
     fail "wgwm всё ещё спрашивает подтверждение запуска"
 fi
-assert_contains "$INSTALLER" 'confirm_yes "Установить WG Watchdog?"' "подтверждение первой установки"
+assert_contains "$INSTALLER" 'confirm_yes "Установить WG Watchdog Manager?"' "подтверждение первой установки"
 assert_contains "$INSTALLER" 'show_summary' "итог первой установки"
 pass "подтверждение осталось только у первой установки"
 
@@ -968,7 +965,6 @@ TMP_DIR="$UNINSTALL_ROOT/tmp"
 CRONTAB_PATH="$UNINSTALL_ROOT/crontab"
 CRON_INIT=/bin/true
 WATCHDOG_PATH="$UNINSTALL_ROOT/bin/wg-watchdog.sh"
-LEGACY_CONFIG="$UNINSTALL_ROOT/legacy.conf"
 MANAGER_PATH="$UNINSTALL_ROOT/bin/wg-watchdog-manager"
 SHORT_COMMAND="$UNINSTALL_ROOT/bin/wgwm"
 mkdir -p "$CONFIG_DIR" "$STATE_DIR/wg-watchdog-Wireguard0.lock" "$TMP_DIR" "$UNINSTALL_ROOT/bin"
@@ -1011,7 +1007,6 @@ pass "штатное удаление сохраняет сторонние за
     WATCHDOG_PATH="$keep_root/bin/wg-watchdog.sh"
     MANAGER_PATH="$keep_root/bin/wg-watchdog-manager"
     SHORT_COMMAND="$keep_root/bin/wgwm"
-    LEGACY_CONFIG="$keep_root/legacy.conf"
     mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR" "$TMP_DIR" "$keep_root/bin"
     printf "JOB_ID='Wireguard0'\n" > "$CONFIG_DIR/Wireguard0.conf"
     printf "LAST_RESULT='туннель работает'\n" > "$STATE_DIR/Wireguard0.state"
@@ -1054,7 +1049,6 @@ pass "программу можно удалить, сохранив задан�
     WATCHDOG_PATH="$cancel_root/bin/wg-watchdog.sh"
     MANAGER_PATH="$cancel_root/bin/wg-watchdog-manager"
     SHORT_COMMAND="$cancel_root/bin/wgwm"
-    LEGACY_CONFIG="$cancel_root/legacy.conf"
     mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$RUN_DIR" "$TMP_DIR" "$cancel_root/bin"
     printf "JOB_ID='Wireguard0'\n" > "$CONFIG_DIR/Wireguard0.conf"
     : > "$WATCHDOG_PATH"
@@ -1154,8 +1148,8 @@ installer_env() {
         sh "$INSTALLER" "$@"
 }
 installer_env > "$INSTALL_ROOT/first-output"
-assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog? [Y/n]' "подтверждение установки"
-assert_contains "$INSTALL_ROOT/first-output" "WG Watchdog $manager_version установлен." "summary установки"
+assert_contains "$INSTALL_ROOT/prompt" 'Установить WG Watchdog Manager? [Y/n]' "подтверждение установки"
+assert_contains "$INSTALL_ROOT/first-output" "WG Watchdog Manager $manager_version установлен." "summary установки"
 assert_contains "$INSTALL_ROOT/first-output" 'Принудительно переустановить:' "команда переустановки"
 [ -x "$INSTALL_OPT/bin/wg-watchdog-manager" ] || fail "менеджер не установлен"
 [ -L "$INSTALL_OPT/bin/wgwm" ] || fail "wgwm не создана установщиком"
@@ -1168,7 +1162,7 @@ pass "первая установка ставит зависимости, за�
 
 cat > "$INSTALL_OPT/bin/wg-watchdog-manager" <<'EOF'
 #!/bin/sh
-VERSION_URL=test
+AUTHOR="org1org"
 printf 'launched\n' > "$MOCK_MANAGER_LOG"
 EOF
 chmod 755 "$INSTALL_OPT/bin/wg-watchdog-manager"
@@ -1176,7 +1170,7 @@ MOCK_MANAGER_LOG="$INSTALL_ROOT/manager-launched"
 export MOCK_MANAGER_LOG
 installer_env > "$INSTALL_ROOT/repeat-output"
 assert_contains "$MOCK_MANAGER_LOG" launched "повторный запуск менеджера"
-if grep -F 'Загружаю WG Watchdog' "$INSTALL_ROOT/repeat-output" >/dev/null; then
+if grep -F 'Загружаю WG Watchdog Manager' "$INSTALL_ROOT/repeat-output" >/dev/null; then
     fail "повторный запуск без --force загрузил файлы"
 fi
 pass "повторная установочная команда только запускает менеджер"
@@ -1185,7 +1179,7 @@ pass "повторная установочная команда только з
 installer_env --force > "$INSTALL_ROOT/force-output"
 assert_contains "$INSTALL_OPT/bin/wg-watchdog-manager" "VERSION=\"$manager_version\"" "принудительная переустановка менеджера"
 assert_empty "$INSTALL_ROOT/prompt" "--force не должен спрашивать подтверждение"
-assert_contains "$INSTALL_ROOT/force-output" "WG Watchdog $manager_version установлен." "summary --force"
+assert_contains "$INSTALL_ROOT/force-output" "WG Watchdog Manager $manager_version установлен." "summary --force"
 pass "ключ --force принудительно переустанавливает файлы"
 
 # Regression: cron generation must not replace the caller's selected job.
@@ -1379,7 +1373,7 @@ pass "отложенный cron тихо завершается после уд�
     WG_WATCHDOG_OUTPUT="$direct_root/output" \
         sh "$MANAGER" --uninstall > "$direct_root/result"
     [ ! -e "$direct_root/opt/bin/wg-watchdog-manager" ] || fail "прямое удаление не удалило менеджер"
-    assert_contains "$direct_root/result" 'WG Watchdog и все его задания удалены' "результат прямого удаления"
+    assert_contains "$direct_root/result" 'WG Watchdog Manager и все его задания удалены' "результат прямого удаления"
     assert_contains "$direct_root/opt/etc/crontab" 'foreign-task' "чужой cron"
 )
 pass "прямое удаление работает без opkg и установки зависимостей"
@@ -1428,7 +1422,6 @@ pass "обслуживание продолжает работу после за
     prepare_dialog_case failed-uninstall
     WATCHDOG_PATH="$DIALOG_ROOT/watchdog"
     MANAGER_PATH="$DIALOG_ROOT/manager"
-    LEGACY_CONFIG="$DIALOG_ROOT/legacy"
     SHORT_COMMAND="$DIALOG_ROOT/wgwm"
     : > "$WATCHDOG_PATH"
     : > "$MANAGER_PATH"
@@ -1444,7 +1437,7 @@ pass "обслуживание продолжает работу после за
         fail "ошибка удаления скрыта"
     fi
     assert_contains "$DIALOG_ROOT/output" 'удаление не завершено' "частичное удаление"
-    if grep -F 'WG Watchdog удалён.' "$DIALOG_ROOT/output" >/dev/null; then fail "ложный успех удаления"; fi
+    if grep -F 'WG Watchdog Manager удалён.' "$DIALOG_ROOT/output" >/dev/null; then fail "ложный успех удаления"; fi
 )
 pass "ошибка удаления файла явно отмечается как незавершённое удаление"
 

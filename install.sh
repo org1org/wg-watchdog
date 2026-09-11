@@ -1,8 +1,8 @@
 #!/bin/sh
 
-# Compact bootstrap installer for WG Watchdog.
+# Compact bootstrap installer for WG Watchdog Manager.
 
-VERSION="1.8.5"
+VERSION="1.0.0"
 BASE_URL="${WG_WATCHDOG_BASE_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog/main}"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
 RELEASE_MANIFEST_URL="${WG_WATCHDOG_RELEASE_MANIFEST_URL:-$BASE_URL/RELEASE}"
@@ -169,7 +169,7 @@ show_summary() {
         run_command=wgwm
     fi
     say ""
-    say "WG Watchdog $VERSION установлен."
+    say "WG Watchdog Manager $VERSION установлен."
     say ""
     say "Установлено:"
     say "  Менеджер:  $MANAGER_PATH"
@@ -208,10 +208,9 @@ command -v "$OPKG_BIN" >/dev/null 2>&1 || die "команда opkg не найд
 [ -r "$INPUT_DEVICE" ] && [ -w "$OUTPUT_DEVICE" ] || die "установщик нужно запускать из интерактивного терминала"
 mkdir -p "$OPT_ROOT/bin" "$TMP_DIR" || die "не удалось подготовить каталог $OPT_ROOT/bin"
 
-# Версии 1.3.0+ сами проверяют обновления. Повторный запуск ссылки только
-# восстанавливает короткую команду при необходимости и открывает менеджер.
+# Повторный запуск установщика открывает уже установленный менеджер.
 if [ "$FORCE_INSTALL" != "yes" ] && [ -x "$MANAGER_PATH" ] && [ -x "$WATCHDOG_PATH" ] && \
-   grep -q '^VERSION_URL=' "$MANAGER_PATH" 2>/dev/null; then
+   grep -q '^AUTHOR="org1org"$' "$MANAGER_PATH" 2>/dev/null; then
     exec "$MANAGER_PATH"
     die "не удалось запустить установленный менеджер"
 fi
@@ -221,9 +220,9 @@ if [ ! -e "$MANAGER_PATH" ] && [ ! -e "$WATCHDOG_PATH" ]; then
     FIRST_INSTALL=yes
 fi
 if [ "$FIRST_INSTALL" = "yes" ] && [ "$FORCE_INSTALL" != "yes" ]; then
-    say "WG Watchdog контролирует доступность WG-сервера и перезапускает"
+    say "WG Watchdog Manager контролирует доступность WG-сервера и перезапускает"
     say "зависший WireGuard-интерфейс по заданным правилам."
-    confirm_yes "Установить WG Watchdog?" || {
+    confirm_yes "Установить WG Watchdog Manager?" || {
         say "Установка отменена."
         exit 0
     }
@@ -237,7 +236,7 @@ tmp_manager=$REPLY
 command -v "$SHA256_BIN" >/dev/null 2>&1 || die "команда sha256sum не найдена"
 fetch_release_manifest
 release_url="$RAW_REPOSITORY_URL/$RELEASE_COMMIT"
-say "Загружаю WG Watchdog $VERSION..."
+say "Загружаю WG Watchdog Manager $VERSION..."
 download_file "$release_url/wg-watchdog.sh" "$tmp_watchdog" || die "не удалось загрузить watchdog"
 download_file "$release_url/wg-watchdog-manager.sh" "$tmp_manager" || die "не удалось загрузить менеджер"
 validate_download_size "$tmp_watchdog" 131072 watchdog
