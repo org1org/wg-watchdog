@@ -2,7 +2,7 @@
 
 # Compact bootstrap installer for WG Watchdog Manager.
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 BASE_URL="${WG_WATCHDOG_BASE_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog/main}"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
 RELEASE_MANIFEST_URL="${WG_WATCHDOG_RELEASE_MANIFEST_URL:-$BASE_URL/RELEASE}"
@@ -90,6 +90,7 @@ fetch_release_manifest() {
     release_file=$REPLY
     download_file "$RELEASE_MANIFEST_URL" "$release_file" || die "не удалось загрузить манифест выпуска"
     release_values=$(awk -F= '
+        NF != 2 { bad = 1; next }
         $1 == "VERSION" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { version = $2; versions++; next }
         $1 == "COMMIT" && length($2) == 40 && $2 !~ /[^0-9a-f]/ { commit = $2; commits++; next }
         $1 == "WATCHDOG_SHA256" && length($2) == 64 && $2 !~ /[^0-9a-f]/ { watchdog = $2; watchdogs++; next }

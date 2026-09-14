@@ -4,6 +4,7 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -24,12 +25,11 @@ jobs:
 
       - name: Check POSIX shell syntax
         run: |
-          sh -n install.sh wg-watchdog-manager.sh wg-watchdog.sh tests/run.sh
-          dash -n install.sh wg-watchdog-manager.sh wg-watchdog.sh tests/run.sh
-          busybox ash -n install.sh
-          busybox ash -n wg-watchdog-manager.sh
-          busybox ash -n wg-watchdog.sh
-          busybox ash -n tests/run.sh
+          for script in install.sh wg-watchdog-manager.sh wg-watchdog.sh tests/run.sh; do
+            sh -n "$script"
+            dash -n "$script"
+            busybox ash -n "$script"
+          done
 
       - name: Run static analysis
         run: shellcheck --shell=sh --severity=error install.sh wg-watchdog-manager.sh wg-watchdog.sh tests/run.sh
@@ -38,10 +38,13 @@ jobs:
         run: sudo sh tests/run.sh
 
       - name: Run functional tests with dash
-        run: sudo dash tests/run.sh
+        run: sudo env TEST_WORKER_SHELL=dash dash tests/run.sh
 
       - name: Run functional tests with BusyBox ash
-        run: sudo busybox ash tests/run.sh
+        run: |
+          printf '#!/bin/sh\nexec busybox ash "$@"\n' > /tmp/wgwm-test-ash
+          chmod +x /tmp/wgwm-test-ash
+          sudo env TEST_WORKER_SHELL=/tmp/wgwm-test-ash busybox ash tests/run.sh
 
       - name: Run terminal tests
         run: python3 tests/terminal.py

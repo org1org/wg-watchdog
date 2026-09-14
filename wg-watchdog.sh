@@ -2,7 +2,7 @@
 
 # WG Watchdog Manager worker for KeeneticOS + Entware
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-/opt/etc/wg-watchdog.d}"
 STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
@@ -32,6 +32,7 @@ log_message() {
 }
 
 is_positive_integer() {
+    [ "${#1}" -le 9 ] || return 1
     case "$1" in
         ''|*[!0-9]*|0|0[0-9]*) return 1 ;;
         *) return 0 ;;
@@ -39,6 +40,7 @@ is_positive_integer() {
 }
 
 is_nonnegative_integer() {
+    [ "${#1}" -le 10 ] || return 1
     case "$1" in
         ''|*[!0-9]*|0[0-9]*) return 1 ;;
         *) return 0 ;;
@@ -51,10 +53,48 @@ is_integer_between() {
 
 valid_address() {
     case "$1" in
-        ''|*[!0-9A-Za-z.:-]*) return 1 ;;
+        ''|-*|*[!0-9A-Za-z.:-]*) return 1 ;;
         *[0-9A-Za-z]*) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# State is data, never executable shell input. Keep the standalone worker and
+# manager readers identical; neither program depends on another installed file.
+read_state_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 1
+    state_seen="|"
+    while IFS= read -r state_line || [ -n "$state_line" ]; do
+        state_key=${state_line%%=*}
+        state_raw=${state_line#*=}
+        [ "$state_key" != "$state_line" ] || return 1
+        case "$state_raw" in
+            \'*\') state_value=${state_raw#\'}; state_value=${state_value%\'} ;;
+            *) return 1 ;;
+        esac
+        case "$state_value" in *\'*|*\`*|*\$*|*\\*) return 1 ;; esac
+        case "$state_seen" in *"|$state_key|"*) return 1 ;; esac
+        state_seen="${state_seen}${state_key}|"
+        case "$state_key" in
+            CONSECUTIVE_FAILURES|LAST_CHECK_EPOCH|LAST_RESTART_EPOCH|LAST_RESTART_UPTIME)
+                case "$state_value" in ''|*[!0-9]*|0[0-9]*) return 1 ;; esac
+                [ "${#state_value}" -le 10 ] || return 1
+                ;;
+        esac
+        case "$state_key" in
+            STATE_BOOT_ID) STATE_BOOT_ID=$state_value ;;
+            CONSECUTIVE_FAILURES) CONSECUTIVE_FAILURES=$state_value ;;
+            LAST_CHECK_EPOCH) LAST_CHECK_EPOCH=$state_value ;;
+            LAST_CHECK_TEXT) LAST_CHECK_TEXT=$state_value ;;
+            LAST_SUCCESS_TEXT) LAST_SUCCESS_TEXT=$state_value ;;
+            LAST_RESTART_EPOCH) LAST_RESTART_EPOCH=$state_value ;;
+            LAST_RESTART_UPTIME) LAST_RESTART_UPTIME=$state_value ;;
+            LAST_RESTART_TEXT) LAST_RESTART_TEXT=$state_value ;;
+            LAST_RESULT) LAST_RESULT=$state_value ;;
+            *) return 1 ;;
+        esac
+    done < "$1"
+    return 0
 }
 
 load_config() {
@@ -197,13 +237,12 @@ reset_state() {
 load_state() {
     reset_state
     [ -r "$STATE_FILE" ] || return 0
-    # Файл создаётся этим скриптом с правами 600.
-    # shellcheck disable=SC1090
-    . "$STATE_FILE"
-    is_nonnegative_integer "${CONSECUTIVE_FAILURES:-}" || CONSECUTIVE_FAILURES=0
-    is_nonnegative_integer "${LAST_CHECK_EPOCH:-}" || LAST_CHECK_EPOCH=0
-    is_nonnegative_integer "${LAST_RESTART_EPOCH:-}" || LAST_RESTART_EPOCH=0
-    is_nonnegative_integer "${LAST_RESTART_UPTIME:-}" || LAST_RESTART_UPTIME=0
+    if ! read_state_file "$STATE_FILE"; then
+        reset_state
+        return 0
+    fi
+    # Saturate an external counter before incrementing it.
+    [ "$CONSECUTIVE_FAILURES" -le "$FAILURE_THRESHOLD" ] || CONSECUTIVE_FAILURES=$FAILURE_THRESHOLD
     if [ "${STATE_BOOT_ID:-}" != "$CURRENT_BOOT_ID" ]; then
         reset_state
     fi
@@ -211,7 +250,7 @@ load_state() {
 
 save_state() {
     mkdir -p "$STATE_DIR" || return 1
-    STATE_TMP="$STATE_FILE.$$"
+    STATE_TMP=$(mktemp "$STATE_FILE.XXXXXX") || return 1
     umask 077
     {
         printf "STATE_BOOT_ID='%s'\n" "$STATE_BOOT_ID"
@@ -291,7 +330,7 @@ fi
 : "${BOOT_GRACE:=180}"
 : "${RECOVERY_CHECK_DELAY:=15}"
 : "${WG_SERVER_PUBLIC_IP:=}"
-: "${INTERNET_CHECK:=yes}"
+: "${INTERNET_CHECK:=no}"
 : "${INTERNET_CHECK_TARGET_1:=1.1.1.1}"
 : "${INTERNET_CHECK_TARGET_2:=8.8.8.8}"
 

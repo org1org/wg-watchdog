@@ -2,7 +2,7 @@
 
 # Interactive WireGuard watchdog manager for KeeneticOS.
 
-VERSION="1.0.1"
+VERSION="1.1.0"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -16,7 +16,6 @@ STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
 UPDATE_DIR="${WG_WATCHDOG_UPDATE_DIR:-$OPT_ROOT/bin/.wg-watchdog-update}"
 TMP_DIR="${WG_WATCHDOG_TMP_DIR:-/tmp}"
-SYS_CLASS_NET="${WG_WATCHDOG_SYS_CLASS_NET:-/sys/class/net}"
 CRONTAB_PATH="$OPT_ROOT/etc/crontab"
 CRON_INIT="$OPT_ROOT/etc/init.d/S10cron"
 NDMC_BIN="${WG_WATCHDOG_NDMC:-ndmc}"
@@ -110,14 +109,19 @@ ui_text() {
         printf '%s\n' "$*"
         return 0
     fi
-    # Word wrapping uses byte lengths conservatively on BusyBox awk.
-    # Long unbroken tokens are clipped by the terminal, never split mid-UTF-8.
-    wrapped_text=$(printf '%s\n' "$*" | awk -v width="$((UI_COLS - 2))" '
+    # Count UTF-8 characters and ignore ANSI colors, including with BusyBox awk.
+    # Long unbroken tokens remain intact; the terminal clips them if necessary.
+    wrapped_text=$(printf '%s\n' "$*" | LC_ALL=C awk -v width="$((UI_COLS - 2))" '
+        function visible_length(text) {
+            gsub(/\033\[[0-9;]*m/, "", text)
+            gsub(/[\200-\277]/, "", text)
+            return length(text)
+        }
         NF == 0 { print ""; next }
         {
             line = ""
             for (i = 1; i <= NF; i++) {
-                if (line != "" && length(line) + length($i) + 1 > width) {
+                if (line != "" && visible_length(line) + visible_length($i) + 1 > width) {
                     print line; line = ""
                 }
                 line = line (line == "" ? "" : " ") $i
@@ -174,10 +178,7 @@ cleanup() {
 }
 finish() {
     cleanup
-    if [ "$MANAGER_INTERFACE_NEEDS_UP" = yes ] && [ -n "$MANAGER_RECOVERY_INTERFACE" ]; then
-        "$NDMC_BIN" -c "interface $MANAGER_RECOVERY_INTERFACE up" >/dev/null 2>&1 || true
-        MANAGER_INTERFACE_NEEDS_UP=no
-    fi
+    recover_manager_interface || true
     end_maintenance
     release_manager_lock
     ui_stop
@@ -186,6 +187,17 @@ trap finish EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+recover_manager_interface() {
+    [ "$MANAGER_INTERFACE_NEEDS_UP" = yes ] || return 0
+    [ -n "$MANAGER_RECOVERY_INTERFACE" ] || return 1
+    if "$NDMC_BIN" -c "interface $MANAGER_RECOVERY_INTERFACE up" >/dev/null 2>&1; then
+        MANAGER_INTERFACE_NEEDS_UP=no
+        return 0
+    fi
+    printf 'Не удалось вернуть %s в up; проверьте интерфейс вручную.\n' "$MANAGER_RECOVERY_INTERFACE" >&2
+    return 1
+}
 
 release_manager_lock() {
     [ "$MANAGER_LOCK_HELD" = yes ] || return 0
@@ -242,7 +254,7 @@ open_console() {
 }
 
 make_temp() {
-    tmp_file=$(mktemp "$TMP_DIR/wg-watchdog.$1.XXXXXX") || die "не удалось создать временный файл"
+    tmp_file=$(mktemp "${2:-$TMP_DIR}/wg-watchdog.$1.XXXXXX") || die "не удалось создать временный файл"
     TMP_FILES="${TMP_FILES}${tmp_file}
 "
     REPLY=$tmp_file
@@ -289,16 +301,27 @@ check_managed_directories() {
 
 end_maintenance() {
     [ "$MAINTENANCE_HELD" = yes ] || return 0
+    rm -f "$RUN_DIR/maintenance.lock/pid"
     rmdir "$RUN_DIR/maintenance.lock" 2>/dev/null || true
     MAINTENANCE_HELD=no
 }
 
 begin_maintenance() {
     mkdir -p "$RUN_DIR" || die "не удалось подготовить каталог блокировок"
-    mkdir "$RUN_DIR/maintenance.lock" 2>/dev/null || {
-        warn "Уже выполняется обслуживание. Повторите позже."
-        return 1
-    }
+    if ! mkdir "$RUN_DIR/maintenance.lock" 2>/dev/null; then
+        # The manager lock serializes recovery. Keep the barrier in place so
+        # cron cannot start a worker while a partial update is being recovered.
+        [ "$MANAGER_LOCK_HELD" = yes ] && [ ! -L "$RUN_DIR/maintenance.lock" ] || {
+            warn "Уже выполняется обслуживание. Повторите позже."
+            return 1
+        }
+        maintenance_pid=$(cat "$RUN_DIR/maintenance.lock/pid" 2>/dev/null || true)
+        if ! is_positive_integer "$maintenance_pid" || kill -0 "$maintenance_pid" 2>/dev/null; then
+            warn "Уже выполняется обслуживание. Повторите позже."
+            return 1
+        fi
+    fi
+    printf '%s\n' "$$" > "$RUN_DIR/maintenance.lock/pid" || return 1
     MAINTENANCE_HELD=yes
     wait_elapsed=0
     while :; do
@@ -365,6 +388,7 @@ confirm_yes() {
 }
 
 is_positive_integer() {
+    [ "${#1}" -le 9 ] || return 1
     case "$1" in
         ''|*[!0-9]*|0|0[0-9]*) return 1 ;;
         *) return 0 ;;
@@ -384,7 +408,7 @@ valid_interface() {
 
 valid_address() {
     case "$1" in
-        ''|*[!0-9A-Za-z.:-]*) return 1 ;;
+        ''|-*|*[!0-9A-Za-z.:-]*) return 1 ;;
         *[0-9A-Za-z]*) return 0 ;;
         *) return 1 ;;
     esac
@@ -530,6 +554,7 @@ fetch_remote_release() {
         return 1
     fi
     release_values=$(awk -F= '
+        NF != 2 { bad = 1; next }
         $1 == "VERSION" && $2 ~ /^[0-9]+\.[0-9]+\.[0-9]+$/ { version = $2; versions++; next }
         $1 == "COMMIT" && length($2) == 40 && $2 !~ /[^0-9a-f]/ { commit = $2; commits++; next }
         $1 == "WATCHDOG_SHA256" && length($2) == 64 && $2 !~ /[^0-9a-f]/ { watchdog = $2; watchdogs++; next }
@@ -666,7 +691,7 @@ recover_interrupted_update() {
             info "Завершена очистка предыдущего обновления."
             ;;
         installing|watchdog-installed)
-            begin_maintenance || return 1
+            if [ "$MAINTENANCE_HELD" != yes ]; then begin_maintenance || return 1; fi
             if rollback_update; then
                 end_maintenance
                 info "Восстановлена предыдущая версия после незавершённого обновления."
@@ -738,7 +763,10 @@ transactional_install() {
         rollback_update || say "КРИТИЧЕСКАЯ ОШИБКА: автоматический откат не завершён."
         return 1
     fi
-    clear_update_dir
+    if ! clear_update_dir; then
+        warn "Обновление установлено; служебные файлы будут очищены при следующем запуске."
+    fi
+    return 0
 }
 
 install_program_files() {
@@ -850,7 +878,7 @@ perform_update() {
     }
     if ! install_program_files; then
         result_card error "Обновление не установлено." \
-            "Предыдущая версия сохранена или восстановлена." \
+            "Проверьте сообщения о восстановлении программных файлов выше." \
             "Проверьте сообщения выше и повторите попытку."
         return 0
     fi
@@ -904,13 +932,6 @@ interface_short_name() {
     result=$(printf '%s\n' "$INTERFACE_LIST" | awk -F '\t' -v wanted="$1" '
         $1 == wanted { print $3; exit }
     ')
-    if [ -z "$result" ]; then
-        interface_number=${1#Wireguard}
-        sys_candidate="wg$interface_number"
-        if [ -e "$SYS_CLASS_NET/$sys_candidate" ]; then
-            result=$sys_candidate
-        fi
-    fi
     REPLY=$result
 }
 
@@ -1130,6 +1151,44 @@ reset_config_values() {
     ENABLED=""
 }
 
+# State is data, never executable shell input. Keep the standalone worker and
+# manager readers identical; neither program depends on another installed file.
+read_state_file() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -r "$1" ] || return 1
+    state_seen="|"
+    while IFS= read -r state_line || [ -n "$state_line" ]; do
+        state_key=${state_line%%=*}
+        state_raw=${state_line#*=}
+        [ "$state_key" != "$state_line" ] || return 1
+        case "$state_raw" in
+            \'*\') state_value=${state_raw#\'}; state_value=${state_value%\'} ;;
+            *) return 1 ;;
+        esac
+        case "$state_value" in *\'*|*\`*|*\$*|*\\*) return 1 ;; esac
+        case "$state_seen" in *"|$state_key|"*) return 1 ;; esac
+        state_seen="${state_seen}${state_key}|"
+        case "$state_key" in
+            CONSECUTIVE_FAILURES|LAST_CHECK_EPOCH|LAST_RESTART_EPOCH|LAST_RESTART_UPTIME)
+                case "$state_value" in ''|*[!0-9]*|0[0-9]*) return 1 ;; esac
+                [ "${#state_value}" -le 10 ] || return 1
+                ;;
+        esac
+        case "$state_key" in
+            STATE_BOOT_ID) STATE_BOOT_ID=$state_value ;;
+            CONSECUTIVE_FAILURES) CONSECUTIVE_FAILURES=$state_value ;;
+            LAST_CHECK_EPOCH) LAST_CHECK_EPOCH=$state_value ;;
+            LAST_CHECK_TEXT) LAST_CHECK_TEXT=$state_value ;;
+            LAST_SUCCESS_TEXT) LAST_SUCCESS_TEXT=$state_value ;;
+            LAST_RESTART_EPOCH) LAST_RESTART_EPOCH=$state_value ;;
+            LAST_RESTART_UPTIME) LAST_RESTART_UPTIME=$state_value ;;
+            LAST_RESTART_TEXT) LAST_RESTART_TEXT=$state_value ;;
+            LAST_RESULT) LAST_RESULT=$state_value ;;
+            *) return 1 ;;
+        esac
+    done < "$1"
+    return 0
+}
+
 load_config() {
     config_file=$1
     expected_job=${2:-}
@@ -1181,9 +1240,9 @@ load_config() {
 
 write_config() {
     destination="$CONFIG_DIR/$JOB_ID.conf"
-    make_temp config
+    make_temp config "$CONFIG_DIR"
     tmp_config=$REPLY
-    cat > "$tmp_config" <<EOF
+    cat > "$tmp_config" <<EOF || die "не удалось записать конфигурацию"
 # WG Watchdog — управляется через wgwm; формат конфигурации 1
 JOB_ID='$JOB_ID'
 WG_INTERFACE='$WG_INTERFACE'
@@ -1236,7 +1295,7 @@ rewrite_crontab() (
     trap cleanup EXIT
     make_temp cron-clean
     clean_file=$REPLY
-    make_temp cron-new
+    make_temp cron-new "${CRONTAB_PATH%/*}"
     new_file=$REPLY
 
     if [ -f "$CRONTAB_PATH" ]; then
@@ -1320,7 +1379,7 @@ configure_job() {
         }
         old_interface=$WG_INTERFACE
         default_server=$WG_SERVER_TUNNEL_IP
-        default_internet_check=${INTERNET_CHECK:-yes}
+        default_internet_check=${INTERNET_CHECK:-no}
         default_internet_target_1=${INTERNET_CHECK_TARGET_1:-1.1.1.1}
         default_internet_target_2=${INTERNET_CHECK_TARGET_2:-8.8.8.8}
         default_public_ip=${WG_SERVER_PUBLIC_IP:-}
@@ -1623,10 +1682,12 @@ show_job_status() {
     LAST_SUCCESS_TEXT="никогда"
     LAST_RESTART_TEXT="никогда"
     LAST_RESULT="ещё не проверялось"
-    if [ -r "$state_file" ]; then
-        # Файл создаётся watchdog с правами 600.
-        # shellcheck disable=SC1090
-        . "$state_file"
+    if ! read_state_file "$state_file"; then
+        CONSECUTIVE_FAILURES=0
+        LAST_CHECK_TEXT="никогда"
+        LAST_SUCCESS_TEXT="никогда"
+        LAST_RESTART_TEXT="никогда"
+        LAST_RESULT="ещё не проверялось"
     fi
     if [ "$ENABLED" = "yes" ]; then state="включено"; else state="выключено"; fi
     detect_interfaces
@@ -1713,6 +1774,7 @@ EOF
 }
 
 force_restart_job() {
+    recover_manager_interface || return 1
     SELECTED_JOB=$1
     valid_interface "$SELECTED_JOB" || return 1
     load_config "$CONFIG_DIR/$SELECTED_JOB.conf" "$SELECTED_JOB" || {
@@ -1731,15 +1793,14 @@ force_restart_job() {
     MANAGER_RECOVERY_INTERFACE=$WG_INTERFACE
     MANAGER_INTERFACE_NEEDS_UP=yes
     if ! "$NDMC_BIN" -c "interface $WG_INTERFACE down" >/dev/null 2>&1; then
-        MANAGER_INTERFACE_NEEDS_UP=no
+        recover_manager_interface || true
         end_maintenance
         result_card error "Не удалось выключить $WG_INTERFACE."
         return 1
     fi
     "$SLEEP_BIN" "$RESTART_DELAY"
     if ! "$NDMC_BIN" -c "interface $WG_INTERFACE up" >/dev/null 2>&1; then
-        "$NDMC_BIN" -c "interface $WG_INTERFACE up" >/dev/null 2>&1 || true
-        MANAGER_INTERFACE_NEEDS_UP=no
+        recover_manager_interface || true
         end_maintenance
         result_card error "Не удалось включить $WG_INTERFACE." \
             "Выполнена повторная попытка; проверьте интерфейс вручную."
@@ -1753,7 +1814,7 @@ force_restart_job() {
 
 remove_managed_cron() {
     [ -f "$CRONTAB_PATH" ] || return 0
-    make_temp cron-uninstall
+    make_temp cron-uninstall "${CRONTAB_PATH%/*}"
     clean_file=$REPLY
     filter_managed_cron > "$clean_file" || die "повреждены границы блока WG Watchdog в crontab; удаление отменено"
     if cmp -s "$clean_file" "$CRONTAB_PATH"; then
@@ -1843,34 +1904,28 @@ uninstall_program() {
 
 show_header() {
     if [ "${1:-compact}" = main ]; then
-        center_header_line ' __        __  ____  __  __'
-        center_header_line ' \ \      / / / ___||  \/  |'
-        center_header_line '  \ \ /\ / / | |  _| |\/| |'
-        center_header_line '   \ V  V /  | |_| | |  | |'
-        center_header_line '    \_/\_/    \____|_|  |_|'
-        center_header_line 'WG Watchdog Manager'
-        center_header_line "WireGuard recovery | v$VERSION | $AUTHOR"
+        header_line '__        __    ____    __  __'
+        header_line '\ \      / /   / ___|  |  \/  |'
+        header_line ' \ \ /\ / /   | |  _   | |\/| |'
+        header_line '  \ V  V /    | |_| |  | |  | |'
+        header_line '   \_/\_/      \____|  |_|  |_|'
+        header_line 'WG Watchdog Manager'
+        header_line "WireGuard recovery | v$VERSION | $AUTHOR"
     else
         say "${COLOR_CYAN}WG Watchdog Manager  /  $VERSION${COLOR_RESET}"
         say "Автор: $AUTHOR · Контроль WireGuard"
     fi
 }
 
-center_header_line() {
+header_line() {
     header_text=$1
     if [ "$UI_ACTIVE" != yes ]; then
-        printf '%s\n' "$header_text"
+        printf ' %s\n' "$header_text"
         return 0
-    fi
-    header_width=${#header_text}
-    if [ "$header_width" -lt "$UI_COLS" ]; then
-        header_padding=$(((UI_COLS - header_width) / 2))
-    else
-        header_padding=0
     fi
     [ "$UI_ROW" -lt "$((UI_ROWS - 2))" ] || ui_pause
     printf '\033[%s;1H\033[2K%*s%s%s%s' \
-        "$UI_ROW" "$header_padding" '' "$COLOR_CYAN" "$header_text" "$COLOR_RESET"
+        "$UI_ROW" 1 '' "$COLOR_CYAN" "$header_text" "$COLOR_RESET"
     UI_ROW=$((UI_ROW + 1))
 }
 
@@ -2109,7 +2164,11 @@ if [ "${1:-}" != --plain ]; then ui_start; fi
 check_managed_directories
 acquire_manager_lock || die "менеджер уже запущен или его блокировка не завершена; закройте другую сессию"
 MANAGER_LOCK_HELD=yes
+if [ -d "$RUN_DIR/maintenance.lock" ]; then
+    begin_maintenance || die "не удалось восстановить блокировку обслуживания"
+fi
 recover_interrupted_update || die "не удалось восстановить незавершённое обновление; запустите установщик с --force"
+end_maintenance
 if [ "${1:-}" = --uninstall ]; then
     uninstall_program
     exit 0

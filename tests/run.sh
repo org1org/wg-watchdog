@@ -106,7 +106,7 @@ run_watchdog() {
     WG_WATCHDOG_LOGGER="$MOCK_BIN/logger" \
     WG_WATCHDOG_SLEEP="$MOCK_BIN/sleep" \
     WG_WATCHDOG_PATH="$MOCK_BIN:/usr/bin:/bin" \
-        sh "$WATCHDOG" --job Wireguard0 "$@"
+        "${TEST_WORKER_SHELL:-sh}" "$WATCHDOG" --job Wireguard0 "$@"
 }
 
 load_test_state() {
@@ -365,6 +365,39 @@ assert_empty "$MOCK_DIR/ndmc.log" "дубликат ключа не должен
 pass "watchdog не выполняет конфигурацию и отклоняет неизвестные или повторные ключи"
 
 # Чистые функции менеджера: интервалы и cron-выражения.
+# Untrusted state must never execute or redirect a check to another interface.
+new_case
+write_config 10.0.0.1 "" 1 yes no
+printf "LAST_RESULT='\$(touch %s)'\n" "$CASE_DIR/executed" > "$STATE_DIR/Wireguard0.state"
+run_watchdog healthy 2000 --force >/dev/null
+[ ! -e "$CASE_DIR/executed" ] || fail "worker исполнил файл состояния"
+load_test_state
+assert_equal "$LAST_RESULT" 'туннель работает' "сброс повреждённого состояния"
+pass "состояние worker читается как данные без исполнения команд"
+
+new_case
+write_config 10.0.0.1 "" 2 yes no
+printf "CONSECUTIVE_FAILURES='999999999999999999999999'\n" > "$STATE_DIR/Wireguard0.state"
+run_watchdog tunnel_down 2000 --force >/dev/null
+load_test_state
+assert_equal "$CONSECUTIVE_FAILURES" 1 "переполненный счётчик сбрасывается"
+assert_empty "$MOCK_DIR/ndmc.log" "повреждённый счётчик не вызывает restart"
+pass "переполнение чисел в состоянии не запускает преждевременный restart"
+
+new_case
+write_config -f "" 1 yes no
+if run_watchdog healthy 2000 --force >/dev/null; then fail "адрес-опция принят"; fi
+assert_empty "$MOCK_DIR/ping.log" "небезопасный адрес не передаётся ping"
+pass "адрес, начинающийся с дефиса, отклоняется до ping"
+
+new_case
+write_config 10.0.0.1 "" 1 yes
+sed -i '/^INTERNET_CHECK=/d' "$CONFIG_DIR/Wireguard0.conf"
+run_watchdog tunnel_down 2000 --force >/dev/null
+if grep -F '1.1.1.1' "$MOCK_DIR/ping.log" >/dev/null; then fail "проверка интернета включена сама"; fi
+assert_contains "$MOCK_DIR/ndmc.log" 'interface Wireguard0 down' "full-tunnel recovery"
+pass "неполные настройки не включают внешнюю проверку самовольно"
+
 WG_WATCHDOG_LIB_ONLY=yes
 export WG_WATCHDOG_LIB_ONLY
 # shellcheck disable=SC1090
@@ -506,14 +539,14 @@ suggest_server_address Wireguard9
 assert_equal "$SUGGESTED_SERVER_IP" "" "адрес .1 не должен подсказывать сам себя"
 pass "адрес .1 предлагается только как осторожная IPv4-подсказка"
 
-# Короткое имя можно получить из sysfs, если его нет в running-config.
-SYS_CLASS_NET="$TEST_ROOT/sys-class-net"
-mkdir -p "$SYS_CLASS_NET/wg8"
+# The existence of wg8 does not prove that it belongs to Wireguard8.
 INTERFACE_LIST='Wireguard8	без описания	'
 interface_short_name Wireguard8
-assert_equal "$REPLY" wg8 "короткое имя из sysfs"
-pass "короткое имя интерфейса имеет безопасный резервный источник"
-SYS_CLASS_NET=/sys/class/net
+assert_equal "$REPLY" "" "неизвестное имя не вычисляется из номера"
+INTERFACE_LIST='Wireguard8	другой номер	wg3'
+interface_short_name Wireguard8
+assert_equal "$REPLY" wg3 "используется явное системное имя"
+pass "короткое имя берётся только из явного соответствия"
 NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config"
 detect_interfaces
 
@@ -894,7 +927,7 @@ watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$WATCHDOG" | head -n 1)
 installer_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$INSTALLER" | head -n 1)
 assert_equal "$watchdog_version" "$manager_version" "версия watchdog"
 assert_equal "$installer_version" "$manager_version" "версия установщика"
-assert_equal "$manager_version" 1.0.1 "номер публичного выпуска"
+assert_equal "$manager_version" 1.1.0 "номер публичного выпуска"
 pass "версии исполняемых файлов совпадают"
 
 # Семантическое сравнение и строгий манифест выпуска.
@@ -1602,6 +1635,9 @@ pass "ошибка замены менеджера откатывает оба �
     cp "$MANAGER_PATH" "$UPDATE_DIR/manager.old"
     cp "$UPDATE_CASE_ROOT/watchdog.new" "$WATCHDOG_PATH"
     printf 'watchdog-installed\n' > "$UPDATE_DIR/state"
+    mkdir -p "$RUN_DIR/maintenance.lock"
+    printf '99999999\n' > "$RUN_DIR/maintenance.lock/pid"
+    MANAGER_LOCK_HELD=yes
     recover_interrupted_update >/dev/null
     cmp -s "$WATCHDOG_PATH" "$UPDATE_CASE_ROOT/watchdog.expected" || fail "watchdog не восстановлен после обрыва"
     cmp -s "$MANAGER_PATH" "$UPDATE_CASE_ROOT/manager.expected" || fail "менеджер изменён при восстановлении"
@@ -1738,5 +1774,64 @@ if grep -F 'logread' "$MANAGER" "$REPO_DIR/docs/keenetic-acceptance.md" >/dev/nu
     fail "в подсказках осталась отсутствующая в KeeneticOS команда logread"
 fi
 pass "подсказки журнала используют ndmc KeeneticOS"
+
+# Manager reads the same state grammar, even in a status-only operation.
+(
+    STATE_DIR="$TEST_ROOT/status-untrusted"
+    mkdir -p "$STATE_DIR"
+    CONFIG_DIR="$MANAGER_ROOT/config"
+    printf "LAST_RESULT='\$(touch %s)'\n" "$STATE_DIR/executed" > "$STATE_DIR/Wireguard0.state"
+    show_job_status Wireguard0 > "$STATE_DIR/output"
+    [ ! -e "$STATE_DIR/executed" ] || fail "менеджер исполнил состояние"
+    assert_contains "$STATE_DIR/output" 'ещё не проверялось' "статус повреждённого состояния"
+)
+pass "просмотр статуса не исполняет файл состояния"
+
+# Even a failed down may have changed the interface before reporting an error.
+(
+    CONFIG_DIR="$MANAGER_ROOT/config"
+    RUN_DIR="$TEST_ROOT/failed-down-run"
+    mkdir -p "$RUN_DIR"
+    NDMC_BIN="$TEST_ROOT/failed-down-ndmc"
+    cat > "$NDMC_BIN" <<'MOCK'
+#!/bin/sh
+printf '%s\n' "$*" >> "$MOCK_RESTART_LOG"
+case "$*" in *down) exit 1 ;; esac
+MOCK
+    chmod 755 "$NDMC_BIN"
+    MOCK_RESTART_LOG="$TEST_ROOT/failed-down-log"
+    export MOCK_RESTART_LOG
+    printf 'yes\n' > "$TEST_ROOT/failed-down-answer"
+    INPUT_DEVICE="$TEST_ROOT/failed-down-answer"
+    OUTPUT_DEVICE="$TEST_ROOT/failed-down-prompt"
+    open_console
+    if force_restart_job Wireguard0 > "$TEST_ROOT/failed-down-output"; then fail "ошибка down скрыта"; fi
+    assert_contains "$MOCK_RESTART_LOG" 'interface Wireguard0 up' "возврат в up после ошибки down"
+    assert_equal "$MANAGER_INTERFACE_NEEDS_UP" no "успешное защитное включение"
+)
+pass "ошибка ручного down также вызывает защитное включение"
+
+# A killed manager leaves its maintenance barrier; recovery must adopt it
+# without exposing partially installed files to cron workers.
+(
+    RUN_DIR="$TEST_ROOT/stale-maintenance"
+    mkdir -p "$RUN_DIR/maintenance.lock"
+    printf '99999999\n' > "$RUN_DIR/maintenance.lock/pid"
+    acquire_manager_lock || fail "блокировка менеджера"
+    MANAGER_LOCK_HELD=yes
+    begin_maintenance || fail "зависшее обслуживание не восстановлено"
+    assert_equal "$(cat "$RUN_DIR/maintenance.lock/pid")" "$$" "новый владелец обслуживания"
+    end_maintenance
+    release_manager_lock
+    [ ! -d "$RUN_DIR/maintenance.lock" ] || fail "блокировка обслуживания осталась"
+)
+pass "обслуживание восстанавливается после завершения прежнего владельца"
+
+(
+    RELEASE_MANIFEST_URL="$TEST_ROOT/release-extra-field"
+    sed 's/^VERSION=.*/VERSION=1.9.0=unexpected/' "$INSTALL_ROOT/RELEASE" > "$RELEASE_MANIFEST_URL"
+    if fetch_remote_release; then fail "лишний разделитель манифеста принят"; fi
+)
+pass "манифест отклоняет лишние разделители полей"
 
 printf '\nВсе тесты пройдены: %s\n' "$PASS_COUNT"

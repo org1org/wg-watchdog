@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [RELEASE]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: verify
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate manifest and source
+        run: |
+          set -eu
+          test "$(wc -l < RELEASE)" -eq 4
+          version=$(sed -n 's/^VERSION=//p' RELEASE)
+          commit=$(sed -n 's/^COMMIT=//p' RELEASE)
+          printf '%s\n' "$version" | grep -Ex '[0-9]+\.[0-9]+\.[0-9]+'
+          printf '%s\n' "$commit" | grep -Ex '[0-9a-f]{40}'
+          git merge-base --is-ancestor "$commit" HEAD
+          for script in install.sh wg-watchdog.sh wg-watchdog-manager.sh; do
+            test "$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$script")" = "$version"
+            git diff --exit-code "$commit" HEAD -- "$script"
+          done
+          printf '%s  %s\n' \
+            "$(sed -n 's/^WATCHDOG_SHA256=//p' RELEASE)" wg-watchdog.sh \
+            "$(sed -n 's/^MANAGER_SHA256=//p' RELEASE)" wg-watchdog-manager.sh | sha256sum -c -
+
+      - name: Publish annotated tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          version=$(sed -n 's/^VERSION=//p' RELEASE)
+          tag="v$version"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            test "$(git cat-file -t "refs/tags/$tag")" = tag
+            test "$(git rev-parse "$tag^{}")" = "$GITHUB_SHA"
+          else
+            git tag -a "$tag" "$GITHUB_SHA" -m "WG Watchdog Manager $tag"
+            git push origin "refs/tags/$tag"
+          fi
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "WG Watchdog Manager $tag" --notes-file .github/release-notes.md
+          fi

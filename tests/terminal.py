@@ -125,21 +125,21 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                 assert b"\x1b[?7h" in output
                 assert b"\x1b[2J" in output
                 assert b"\x1b[1;36m" in output
-                centered_title = re.search(
-                    rb"\x1b\[\d+;1H\x1b\[2K( *)\x1b\[1;36mWG Watchdog Manager",
-                    output,
-                )
-                assert centered_title, "Название в шапке не найдено"
-                assert len(centered_title.group(1)) == (cols - len("WG Watchdog Manager")) // 2, \
-                    "Название не отцентрировано"
-                subtitle = "WireGuard recovery | v1.0.1 | org1org"
-                centered_subtitle = re.search(
-                    rb"\x1b\[\d+;1H\x1b\[2K( *)\x1b\[1;36m" + subtitle.encode(),
-                    output,
-                )
-                assert centered_subtitle, "Подпись в шапке не найдена"
-                assert len(centered_subtitle.group(1)) == (cols - len(subtitle)) // 2, \
-                    "Подпись не отцентрирована"
+                expected_header = [
+                    '__        __    ____    __  __',
+                    '\\ \\      / /   / ___|  |  \\/  |',
+                    ' \\ \\ /\\ / /   | |  _   | |\\/| |',
+                    '  \\ V  V /    | |_| |  | |  | |',
+                    '   \\_/\\_/      \\____|  |_|  |_|',
+                    "WG Watchdog Manager",
+                    "WireGuard recovery | v1.1.0 | org1org",
+                ]
+                for row, line in enumerate(expected_header, 1):
+                    expected = f"\x1b[{row};1H\x1b[2K \x1b[1;36m{line}\x1b[0m"
+                    assert expected.encode() in output, f"Искажена строка шапки {row}"
+                    assert len(line) + 1 <= cols, "Шапка не помещается"
+            if not plain and rows == 24 and cols == 80 and jobs <= 3 and not actions:
+                assert pages_answered == 0, "Обычное меню потребовало лишнюю страницу"
             assert "Wireguard3".encode() in output, "Показаны не все интерфейсы"
             assert "Два пира".encode() in output, "Не показано описание последнего интерфейса"
             if job_answers:
