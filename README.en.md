@@ -93,16 +93,16 @@ Updates are installed from the main `wgwm` menu.
 
 New jobs use these defaults:
 
-| Setting | Default |
-|---|---:|
-| Check interval | 5 minutes |
-| Ping requests | 3 |
-| Ping timeout | 3 seconds |
-| Failures before restart | 2 |
-| Delay between `down` and `up` | 3 seconds |
-| Post-restart check | after 15 seconds |
-| Restart cooldown | 5 minutes |
-| Router boot grace period | 180 seconds |
+| Setting | Variable | Default |
+|---|---|---:|
+| Check interval | `CHECK_INTERVAL` | 5 minutes |
+| Ping requests | `PING_COUNT` | 3 |
+| Ping timeout | `PING_TIMEOUT` | 3 seconds |
+| Failures before restart | `FAILURE_THRESHOLD` | 2 |
+| Delay between `down` and `up` | `RESTART_DELAY` | 3 seconds |
+| Post-restart check | `RECOVERY_CHECK_DELAY` | after 15 seconds |
+| Restart cooldown | `RESTART_COOLDOWN` | 5 minutes |
+| Router boot grace period | `BOOT_GRACE` | 180 seconds |
 
 Every value can be configured independently for each interface.
 
