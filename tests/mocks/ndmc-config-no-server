@@ -1,5 +1,10 @@
 #!/bin/sh
 
+case "$*" in
+    '-c show running-config') ;;
+    *) exec "$(dirname "$0")/ndmc" "$@" ;;
+esac
+
 cat <<'EOF'
 interface Wireguard8
  description "Резервный офис"

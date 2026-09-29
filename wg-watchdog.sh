@@ -2,7 +2,7 @@
 
 # WG Watchdog Manager worker for KeeneticOS + Entware
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 CONFIG_DIR="${WG_WATCHDOG_CONFIG_DIR:-/opt/etc/wg-watchdog.d}"
 STATE_DIR="${WG_WATCHDOG_STATE_DIR:-/tmp/wg-watchdog}"
 RUN_DIR="${WG_WATCHDOG_RUN_DIR:-/tmp/wg-watchdog}"
@@ -326,7 +326,7 @@ if ! load_config; then
 fi
 
 : "${FAILURE_THRESHOLD:=2}"
-: "${RESTART_COOLDOWN:=30}"
+: "${RESTART_COOLDOWN:=5}"
 : "${BOOT_GRACE:=180}"
 : "${RECOVERY_CHECK_DELAY:=15}"
 : "${WG_SERVER_PUBLIC_IP:=}"

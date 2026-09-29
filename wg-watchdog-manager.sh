@@ -2,7 +2,7 @@
 
 # Interactive WireGuard watchdog manager for KeeneticOS.
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 AUTHOR="org1org"
 BASE_URL="https://raw.githubusercontent.com/org1org/wg-watchdog/main"
 RAW_REPOSITORY_URL="${WG_WATCHDOG_RAW_REPOSITORY_URL:-https://raw.githubusercontent.com/org1org/wg-watchdog}"
@@ -424,7 +424,7 @@ parameter_spec() {
         RESTART_DELAY) SPEC_DEFAULT=3; SPEC_MIN=1; SPEC_MAX=60; SPEC_DESCRIPTION="пауза down/up интерфейса, секунд" ;;
         CHECK_INTERVAL) SPEC_DEFAULT=5; SPEC_MIN=1; SPEC_MAX=60; SPEC_ALLOWED="1 2 3 4 5 6 10 12 15 20 30 60"; SPEC_DESCRIPTION="частота проверки в минутах" ;;
         FAILURE_THRESHOLD) SPEC_DEFAULT=2; SPEC_MIN=1; SPEC_MAX=10; SPEC_DESCRIPTION="неудачных проверок до перезапуска" ;;
-        RESTART_COOLDOWN) SPEC_DEFAULT=30; SPEC_MIN=1; SPEC_MAX=1440; SPEC_DESCRIPTION="пауза между перезапусками, минут" ;;
+        RESTART_COOLDOWN) SPEC_DEFAULT=5; SPEC_MIN=1; SPEC_MAX=1440; SPEC_DESCRIPTION="пауза между перезапусками, минут" ;;
         BOOT_GRACE) SPEC_DEFAULT=180; SPEC_MIN=1; SPEC_MAX=3600; SPEC_DESCRIPTION="ожидание после загрузки роутера, секунд" ;;
         RECOVERY_CHECK_DELAY) SPEC_DEFAULT=15; SPEC_MIN=1; SPEC_MAX=300; SPEC_DESCRIPTION="ожидание проверки после перезапуска, секунд" ;;
         *) return 1 ;;
@@ -1013,6 +1013,9 @@ EOF
 
 detect_peer_defaults() {
     selected_interface=$1
+    selection_mode=${2:-add}
+    configured_tunnel_ip=${3:-}
+    configured_public_ip=${4:-}
     PEER_LIST=$(printf '%s\n' "$RUNNING_CONFIG" | awk -v wanted="$selected_interface" '
         function endpoint_host(value, closing, count, parts) {
             if (substr(value, 1, 1) == "[") {
@@ -1072,7 +1075,27 @@ detect_peer_defaults() {
     [ "$peer_count" -gt 0 ] || return 0
 
     peer_index=1
-    if [ "$peer_count" -gt 1 ]; then
+    if [ "$selection_mode" = edit ]; then
+        selected_peer=""
+        peer_index=1
+        while IFS="$(printf '\t')" read -r endpoint tunnel_ip peer_label; do
+            if { [ -n "$configured_public_ip" ] && [ "$endpoint" = "$configured_public_ip" ]; } || \
+               { [ -n "$configured_tunnel_ip" ] && [ "$tunnel_ip" = "$configured_tunnel_ip" ]; }; then
+                if [ -n "$selected_peer" ]; then
+                    selected_peer=""
+                    break
+                fi
+                selected_peer=$peer_index
+            fi
+            peer_index=$((peer_index + 1))
+        done <<EOF
+$PEER_LIST
+EOF
+        # With one peer there is no ambiguity, even if its internal address
+        # was entered manually and no public probe was saved.
+        if [ "$peer_count" -eq 1 ]; then selected_peer=1; fi
+        [ -n "$selected_peer" ] || return 0
+    elif [ "$peer_count" -gt 1 ]; then
         say "Найдено несколько пиров выбранного интерфейса:"
         while IFS="$(printf '\t')" read -r endpoint tunnel_ip peer_label; do
             [ "$endpoint" = "-" ] && endpoint="внешний адрес не найден"
@@ -1430,12 +1453,7 @@ configure_job() {
 
     show_listen_port_warning "$WG_INTERFACE"
 
-    if [ "$mode" = "add" ]; then
-        detect_peer_defaults "$WG_INTERFACE"
-    else
-        DETECTED_TUNNEL_IP=""
-        DETECTED_PUBLIC_IP=""
-    fi
+    detect_peer_defaults "$WG_INTERFACE" "$mode" "$default_server" "$default_public_ip"
     if [ -z "$default_server" ] && [ -n "$DETECTED_TUNNEL_IP" ]; then
         default_server=$DETECTED_TUNNEL_IP
     fi
@@ -1478,12 +1496,34 @@ configure_job() {
         say "Сервер отвечает на ping."
     else
         say "Сервер не ответил. Возможно, туннель сейчас не работает или ICMP запрещён."
-        say "Enter — отменить настройку."
-        confirm "Продолжить настройку?" || {
-            result_card cancelled "Настройка задания не сохранена."
-            ui_scroll_stop
-            return 1
-        }
+        warn "Перезапуск $WG_INTERFACE может временно прервать SSH через этот туннель."
+        say "Enter — пропустить перезапуск."
+        setup_server_reachable=no
+        if confirm "Перезапустить $WG_INTERFACE сейчас и повторить проверку?"; then
+            restart_configured_interface || {
+                say "Настройка задания не сохранена."
+                ui_scroll_stop
+                return 1
+            }
+            info "Ожидаю $RECOVERY_CHECK_DELAY сек. и проверяю $WG_SERVER_TUNNEL_IP..."
+            "$SLEEP_BIN" "$RECOVERY_CHECK_DELAY"
+            if "$PING_BIN" -c 3 -W 3 "$WG_SERVER_TUNNEL_IP" >/dev/null 2>&1; then
+                setup_server_reachable=yes
+                say "Сервер отвечает после перезапуска."
+            else
+                warn "После перезапуска сервер пока не отвечает."
+            fi
+        fi
+        if [ "$setup_server_reachable" != yes ]; then
+            say "Watchdog будет перезапускать интерфейс после $FAILURE_THRESHOLD неудачных проверок подряд."
+            say "Публичная проверка для этого не требуется."
+            say "Enter — отменить настройку."
+            confirm "Продолжить настройку с недоступным адресом?" || {
+                result_card cancelled "Настройка задания не сохранена."
+                ui_scroll_stop
+                return 1
+            }
+        fi
     fi
 
     say ""
@@ -1789,7 +1829,15 @@ force_restart_job() {
         result_card cancelled "Интерфейс $WG_INTERFACE не перезапускался."
         return 0
     }
-    begin_maintenance || return 0
+    restart_configured_interface
+}
+
+# Use the current settings so the setup wizard can recover an interface before
+# its watchdog job exists. Keep down/up recovery and locking in one place.
+restart_configured_interface() {
+    valid_interface "$WG_INTERFACE" || return 1
+    recover_manager_interface || return 1
+    begin_maintenance || return 1
     MANAGER_RECOVERY_INTERFACE=$WG_INTERFACE
     MANAGER_INTERFACE_NEEDS_UP=yes
     if ! "$NDMC_BIN" -c "interface $WG_INTERFACE down" >/dev/null 2>&1; then
@@ -1904,11 +1952,11 @@ uninstall_program() {
 
 show_header() {
     if [ "${1:-compact}" = main ]; then
-        header_line '__        __    ____    __  __'
-        header_line '\ \      / /   / ___|  |  \/  |'
-        header_line ' \ \ /\ / /   | |  _   | |\/| |'
-        header_line '  \ V  V /    | |_| |  | |  | |'
-        header_line '   \_/\_/      \____|  |_|  |_|'
+        header_line '__        __   ____   __        __  __  __'
+        header_line '\ \      / /  / ___|  \ \      / / |  \/  |'
+        header_line ' \ \ /\ / /  | |  _    \ \ /\ / /  | |\/| |'
+        header_line '  \ V  V /   | |_| |    \ V  V /   | |  | |'
+        header_line '   \_/\_/     \____|     \_/\_/    |_|  |_|'
         header_line 'WG Watchdog Manager'
         header_line "WireGuard recovery | v$VERSION | $AUTHOR"
     else

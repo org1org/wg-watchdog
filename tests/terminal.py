@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
              actions=None, job_answers=None, disabled_jobs=None,
-             update_available=False, wizard_answers=None):
+             update_available=False, wizard_answers=None, full_tunnel=False):
     with tempfile.TemporaryDirectory(prefix="wgwm-pty-") as root:
         master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
@@ -26,7 +26,8 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                    TEST_ROOT=root, TEST_REPO=str(REPO), TEST_PLAIN=str(int(plain)))
         env["TEST_UPDATE_AVAILABLE"] = str(int(update_available))
         env["MOCK_DIR"] = root
-        env["MOCK_SCENARIO"] = "healthy"
+        env["MOCK_SCENARIO"] = "recover_after_restart" if full_tunnel else "healthy"
+        env["TEST_NDMC_FIXTURE"] = "ndmc-config-no-server" if full_tunnel else "ndmc-config"
         env.pop("NO_COLOR", None)
         Path(root, "config").mkdir()
         for number in range(jobs):
@@ -47,7 +48,8 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
             PING_BIN="$TEST_REPO/tests/mocks/ping"
             WATCHDOG_PATH=/opt/bin/wg-watchdog.sh
             mkdir -p "$CONFIG_DIR" "$RUN_DIR"
-            NDMC_BIN="$TEST_REPO/tests/mocks/ndmc-config"
+            NDMC_BIN="$TEST_REPO/tests/mocks/$TEST_NDMC_FIXTURE"
+            SLEEP_BIN="$TEST_REPO/tests/mocks/sleep"
             INPUT_DEVICE=/dev/stdin
             OUTPUT_DEVICE=/dev/stdout
             open_console
@@ -92,6 +94,7 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                     wizard_prompts_seen = sum(output.count(prompt.encode()) for prompt in [
                         "Введите внутренний IP-адрес WireGuard-сервера",
                         "Использовать проверку публичного адреса?",
+                        "Перезапустить Wireguard8 сейчас и повторить проверку?",
                     ])
                     if wizard_prompts_seen > wizard_prompts_answered:
                         wizard_prompts_answered = wizard_prompts_seen
@@ -111,9 +114,11 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                         os.write(master, b"\n")
                 if process.poll() is not None and not ready:
                     break
-            if process.poll() is None:
-                raise AssertionError(output.decode(errors="replace"))
-            process.wait(timeout=2)
+            # PTY EOF can arrive just before waitpid observes process exit.
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError(output.decode(errors="replace")) from exc
             assert sent, output.decode(errors="replace")
             assert process.returncode == (143 if terminate else 0), output
             assert not Path(root, "run", "manager.lock").exists()
@@ -125,23 +130,17 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                 assert b"\x1b[?7h" in output
                 assert b"\x1b[2J" in output
                 assert b"\x1b[1;36m" in output
-                expected_header = [
-                    '__        __    ____    __  __',
-                    '\\ \\      / /   / ___|  |  \\/  |',
-                    ' \\ \\ /\\ / /   | |  _   | |\\/| |',
-                    '  \\ V  V /    | |_| |  | |  | |',
-                    '   \\_/\\_/      \\____|  |_|  |_|',
-                    "WG Watchdog Manager",
-                    "WireGuard recovery | v1.1.0 | org1org",
-                ]
+                expected_header = ['__        __   ____   __        __  __  __', '\\ \\      / /  / ___|  \\ \\      / / |  \\/  |', ' \\ \\ /\\ / /  | |  _    \\ \\ /\\ / /  | |\\/| |', '  \\ V  V /   | |_| |    \\ V  V /   | |  | |', '   \\_/\\_/     \\____|     \\_/\\_/    |_|  |_|', 'WG Watchdog Manager', 'WireGuard recovery | v1.1.1 | org1org']
                 for row, line in enumerate(expected_header, 1):
                     expected = f"\x1b[{row};1H\x1b[2K \x1b[1;36m{line}\x1b[0m"
                     assert expected.encode() in output, f"Искажена строка шапки {row}"
                     assert len(line) + 1 <= cols, "Шапка не помещается"
             if not plain and rows == 24 and cols == 80 and jobs <= 3 and not actions:
                 assert pages_answered == 0, "Обычное меню потребовало лишнюю страницу"
-            assert "Wireguard3".encode() in output, "Показаны не все интерфейсы"
-            assert "Два пира".encode() in output, "Не показано описание последнего интерфейса"
+            expected_interface = "Wireguard8" if full_tunnel else "Wireguard3"
+            expected_description = "Резервный офис" if full_tunnel else "Два пира"
+            assert expected_interface.encode() in output, "Показаны не все интерфейсы"
+            assert expected_description.encode() in output, "Не показано описание интерфейса"
             if job_answers:
                 assert "Интерфейс: Wireguard".encode() in output
                 assert "0) Назад".encode() in output
@@ -157,12 +156,18 @@ def run_case(rows=24, cols=80, terminate=False, plain=False, jobs=0,
                     "Доступное обновление не выделено зелёным"
             if wizard_answers is not None:
                 decoded = output.decode(errors="replace")
-                start = decoded.index("Выбран внутренний адрес: 10.0.0.1.")
+                server = "172.16.6.1" if full_tunnel else "10.0.0.1"
+                start = decoded.index(f"Выбран внутренний адрес: {server}.")
                 finish = decoded.index("Использовать проверку публичного адреса?", start)
                 wizard_section = decoded[start:finish]
                 assert "\x1b[2J" not in wizard_section, \
                     "Экран очищен между шагами мастера"
-                assert "Enter — использовать найденный адрес 10.0.0.1." in decoded
+                if full_tunnel:
+                    assert "Сервер отвечает после перезапуска." in decoded
+                    assert "interface Wireguard8 down" in Path(root, "ndmc.log").read_text()
+                    assert "RESTART_COOLDOWN='5'" in Path(root, "config", "Wireguard8.conf").read_text()
+                else:
+                    assert "Enter — использовать найденный адрес 10.0.0.1." in decoded
                 assert "Enter — не включать проверку публичного адреса." in decoded
             return output.decode(errors="replace")
         finally:
@@ -183,6 +188,8 @@ if __name__ == "__main__":
         dict(update_available=True),
         dict(actions=["1", "0"], job_answers=["1", "0"],
              wizard_answers=["", ""]),
+        dict(actions=["1", "0"], job_answers=["1", "0"], full_tunnel=True,
+             wizard_answers=["172.16.6.1", "y", ""]),
     ]:
         run_case(**case)
         print("ok PTY", case)

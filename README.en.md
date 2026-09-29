@@ -1,18 +1,18 @@
 <div align="left">
 
 <pre>
-__        __    ____    __  __
-\ \      / /   / ___|  |  \/  |
- \ \ /\ / /   | |  _   | |\/| |
-  \ V  V /    | |_| |  | |  | |
-   \_/\_/      \____|  |_|  |_|
+__        __   ____   __        __  __  __
+\ \      / /  / ___|  \ \      / / |  \/  |
+ \ \ /\ / /  | |  _    \ \ /\ / /  | |\/| |
+  \ V  V /   | |_| |    \ V  V /   | |  | |
+   \_/\_/     \____|     \_/\_/    |_|  |_|
 </pre>
 
 ### WG Watchdog Manager
 
 A lightweight WireGuard recovery manager for KeeneticOS.
 
-[![version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com/org1org/wg-watchdog/releases/latest)
+[![version](https://img.shields.io/badge/version-1.1.1-blue)](https://github.com/org1org/wg-watchdog/releases/latest)
 ![shell](https://img.shields.io/badge/shell-POSIX%20sh-4EAA25)
 ![platform](https://img.shields.io/badge/platform-KeeneticOS%205%2B-009EE2)
 ![environment](https://img.shields.io/badge/environment-Entware-555555)
@@ -61,6 +61,9 @@ wgwm
 Select a WireGuard interface and choose **Configure watchdog**. The server tunnel
 address and public Endpoint are taken from the peer configuration when available.
 
+If the tunnel address does not respond, the wizard offers to restart the interface
+and check again. Restarting requires confirmation.
+
 The program interface is currently in Russian; this README provides the complete
 English usage reference.
 
@@ -98,7 +101,7 @@ New jobs use these defaults:
 | Failures before restart | 2 |
 | Delay between `down` and `up` | 3 seconds |
 | Post-restart check | after 15 seconds |
-| Restart cooldown | 30 minutes |
+| Restart cooldown | 5 minutes |
 | Router boot grace period | 180 seconds |
 
 Every value can be configured independently for each interface.

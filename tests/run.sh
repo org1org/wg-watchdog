@@ -168,6 +168,19 @@ run_watchdog tunnel_down 5801 --force >/dev/null
 assert_contains "$MOCK_DIR/ndmc.log" "interface Wireguard0 down" "restart после cooldown"
 pass "после окончания cooldown восстановление снова разрешено"
 
+new_case
+write_config 10.0.0.1 "" 1 yes no
+sed -i '/^RESTART_COOLDOWN=/d' "$CONFIG_DIR/Wireguard0.conf"
+run_watchdog tunnel_down 6000 --force >/dev/null
+: > "$MOCK_DIR/ndmc.log"
+printf '1299.00 0.00\n' > "$CASE_DIR/uptime"
+run_watchdog tunnel_down 6299 --force >/dev/null
+assert_empty "$MOCK_DIR/ndmc.log" "cooldown до пяти минут"
+printf '1300.00 0.00\n' > "$CASE_DIR/uptime"
+run_watchdog tunnel_down 6300 --force >/dev/null
+assert_contains "$MOCK_DIR/ndmc.log" 'interface Wireguard0 down' "restart через пять минут"
+pass "worker использует cooldown пять минут при отсутствии значения"
+
 # Отсутствие интернета не считается ошибкой WireGuard.
 new_case
 write_config 10.0.0.1 "" 2 yes
@@ -231,6 +244,19 @@ if grep -F '1.1.1.1' "$MOCK_DIR/ping.log" >/dev/null || \
     fail "выключенная проверка интернета всё равно отправила ping"
 fi
 pass "выключенная внешняя проверка не блокирует восстановление full-tunnel"
+
+# A manually entered server address on an interface with 0.0.0.0/0 must
+# trigger recovery without enabling the optional public endpoint probe.
+new_case
+write_config 172.16.6.1 "" 2 yes no
+run_watchdog manual_tunnel_down 5750 --force > "$CASE_DIR/first-check"
+assert_empty "$MOCK_DIR/ndmc.log" "первая ошибка ручного адреса"
+run_watchdog manual_tunnel_down 5800 --force > "$CASE_DIR/second-check"
+assert_contains "$MOCK_DIR/ndmc.log" "interface Wireguard0 down" "перезапуск по ручному адресу"
+assert_contains "$MOCK_DIR/ndmc.log" "interface Wireguard0 up" "включение после перезапуска"
+assert_contains "$CASE_DIR/second-check" '172.16.6.1 недоступен — перезапускаю' "причина перезапуска"
+assert_contains "$MOCK_DIR/ping.log" 'manual_tunnel_down | 172.16.6.1' "проверен ручной адрес"
+pass "ручной внутренний адрес восстанавливается без публичной проверки"
 
 # Monotonic uptime, not a backward wall-clock correction, controls cooldown.
 new_case
@@ -452,7 +478,7 @@ assert_equal "$SPEC_ALLOWED" "1 2 3 4 5 6 10 12 15 20 30 60" "точные ин�
 apply_default_parameters
 assert_equal "$PING_COUNT:$PING_TIMEOUT:$RESTART_DELAY:$CHECK_INTERVAL" "3:3:3:5" "основные значения по умолчанию"
 assert_equal "$FAILURE_THRESHOLD:$RESTART_COOLDOWN:$BOOT_GRACE:$RECOVERY_CHECK_DELAY" \
-    "2:30:180:15" "защитные значения по умолчанию"
+    "2:5:180:15" "защитные значения по умолчанию"
 valid_parameter_value RESTART_COOLDOWN 1440 || fail "верхняя граница cooldown отклонена"
 if valid_parameter_value RESTART_COOLDOWN 1441; then fail "превышение cooldown принято"; fi
 if valid_parameter_value PING_COUNT 03; then fail "ведущий ноль принят схемой"; fi
@@ -518,6 +544,14 @@ detect_peer_defaults Wireguard3 >/dev/null
 assert_equal "$DETECTED_PUBLIC_IP" "2001:db8::10" "IPv6 endpoint второго пира"
 assert_equal "$DETECTED_TUNNEL_IP" "10.3.0.10" "внутренний адрес второго пира"
 pass "при нескольких пирах адреса берутся из выбранного пира"
+
+detect_peer_defaults Wireguard0 edit 10.0.0.1 ""
+assert_equal "$DETECTED_PUBLIC_IP" "198.51.100.10" "Endpoint при редактировании"
+detect_peer_defaults Wireguard3 edit 10.3.0.10 ""
+assert_equal "$DETECTED_PUBLIC_IP" "2001:db8::10" "Endpoint нужного пира без нового выбора"
+detect_peer_defaults Wireguard3 edit 172.16.6.1 ""
+assert_equal "$DETECTED_PUBLIC_IP" "" "неоднозначный Endpoint не подставлен"
+pass "редактирование показывает связанный Endpoint без повторного выбора пира"
 
 # При отсутствии адреса сервера адрес интерфейса даёт только неподтверждённую подсказку.
 RUNNING_CONFIG=$(cat <<'EOF'
@@ -655,6 +689,55 @@ pass "новое задание получает рекомендуемые па
 )
 pass "эвристический адрес требует ручного ввода"
 
+(
+    prepare_dialog_case manager-server-unreachable
+    NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config-no-server"
+    MOCK_SCENARIO=manual_tunnel_down
+    export MOCK_SCENARIO
+    printf '1\n172.16.6.1\n\ny\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job add "" > "$DIALOG_ROOT/output"
+    assert_contains "$DIALOG_ROOT/output" 'Watchdog будет перезапускать интерфейс после 2 неудачных проверок подряд.' "порог восстановления"
+    assert_contains "$DIALOG_ROOT/output" 'Публичная проверка для этого не требуется.' "необязательность публичной проверки"
+    assert_empty "$MOCK_DIR/ndmc.log" "Enter не должен перезапускать интерфейс"
+    assert_contains "$CONFIG_DIR/Wireguard8.conf" "WG_SERVER_PUBLIC_IP=''" "отказ от публичной проверки"
+)
+pass "мастер объясняет восстановление при недоступном ручном адресе"
+
+for setup_scenario in recover_after_restart manual_tunnel_down ndmc_fail_down; do
+    (
+        prepare_dialog_case "setup-restart-$setup_scenario"
+        NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config-no-server"
+        SLEEP_BIN="$SCRIPT_DIR/mocks/sleep"
+        MOCK_SCENARIO=$setup_scenario
+        export MOCK_SCENARIO
+        printf '1\n172.16.6.1\ny\ny\n\n' > "$INPUT_DEVICE"
+        if [ "$setup_scenario" = recover_after_restart ]; then
+            printf '1\n172.16.6.1\ny\n\n' > "$INPUT_DEVICE"
+        fi
+        open_console
+        setup_result=0
+        configure_job add "" > "$DIALOG_ROOT/output" || setup_result=$?
+        assert_contains "$MOCK_DIR/ndmc.log" 'interface Wireguard8 down' "перезапуск во время настройки"
+        assert_contains "$MOCK_DIR/ndmc.log" 'interface Wireguard8 up' "защитное включение"
+        [ ! -d "$RUN_DIR/maintenance.lock" ] || fail "блокировка после мастера"
+        if [ "$setup_scenario" = ndmc_fail_down ]; then
+            assert_equal "$setup_result" 1 "ошибка перезапуска"
+            [ ! -f "$CONFIG_DIR/Wireguard8.conf" ] || fail "сохранение после ошибки down"
+        else
+            assert_equal "$setup_result" 0 "успешное сохранение"
+            assert_contains "$CONFIG_DIR/Wireguard8.conf" "RESTART_COOLDOWN='5'" "новое значение cooldown"
+            assert_contains "$MOCK_DIR/sleep.log" '15' "ожидание восстановления"
+            if [ "$setup_scenario" = recover_after_restart ]; then
+                assert_contains "$DIALOG_ROOT/output" 'Сервер отвечает после перезапуска.' "повторный ping"
+            else
+                assert_contains "$DIALOG_ROOT/output" 'После перезапуска сервер пока не отвечает.' "неудачный повторный ping"
+            fi
+        fi
+    )
+done
+pass "мастер перезапускает интерфейс, перепроверяет адрес и обрабатывает ошибку down"
+
 # Выбор интерфейса в главном меню передаётся в настройку без второго вопроса.
 (
     prepare_dialog_case manager-context-add
@@ -743,7 +826,7 @@ ENABLED='yes'
 EOF
 normalize_config_files >/dev/null
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "FAILURE_THRESHOLD='2'" "значение FAILURE_THRESHOLD"
-assert_contains "$CONFIG_DIR/Wireguard0.conf" "RESTART_COOLDOWN='30'" "значение cooldown"
+assert_contains "$CONFIG_DIR/Wireguard0.conf" "RESTART_COOLDOWN='5'" "значение cooldown"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "CHECK_INTERVAL='5'" "нормализация интервала"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK='no'" "безопасное отключение внешней проверки"
 assert_contains "$CONFIG_DIR/Wireguard0.conf" "INTERNET_CHECK_TARGET_1='1.1.1.1'" "первый контрольный адрес"
@@ -927,7 +1010,7 @@ watchdog_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$WATCHDOG" | head -n 1)
 installer_version=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' "$INSTALLER" | head -n 1)
 assert_equal "$watchdog_version" "$manager_version" "версия watchdog"
 assert_equal "$installer_version" "$manager_version" "версия установщика"
-assert_equal "$manager_version" 1.1.0 "номер публичного выпуска"
+assert_equal "$manager_version" 1.1.1 "номер публичного выпуска"
 pass "версии исполняемых файлов совпадают"
 
 # Семантическое сравнение и строгий манифест выпуска.
@@ -1361,8 +1444,44 @@ pass "отмена удаления не выводит ложное сообщ�
     configure_job edit Wireguard3 > "$DIALOG_ROOT/edit-output"
     if grep -F 'Выберите пир' "$OUTPUT_DEVICE" >/dev/null; then fail "повторный выбор пира при редактировании"; fi
     assert_contains "$CONFIG_DIR/Wireguard3.conf" "WG_SERVER_TUNNEL_IP='10.0.0.1'" "сохранённый адрес"
+    if grep -F 'В Endpoint выбранного пира найден публичный адрес:' "$DIALOG_ROOT/edit-output" >/dev/null; then
+        fail "неоднозначный Endpoint показан при редактировании"
+    fi
 )
 pass "редактирование многопирового интерфейса сохраняет адрес без выбора пира"
+
+(
+    TMP_FILES=""
+    trap cleanup EXIT
+    prepare_dialog_case edit-single-peer-endpoint
+    printf '1\n\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job add "" >/dev/null
+    printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job edit Wireguard0 > "$DIALOG_ROOT/edit-output"
+    assert_contains "$DIALOG_ROOT/edit-output" 'В Endpoint выбранного пира найден публичный адрес: 198.51.100.10' "Endpoint в редакторе"
+    assert_contains "$DIALOG_ROOT/edit-output" 'Проверка публичного адреса: выключена.' "Endpoint не включает проверку"
+    assert_contains "$CONFIG_DIR/Wireguard0.conf" "WG_SERVER_PUBLIC_IP=''" "публичная проверка не включена сама"
+)
+pass "редактор показывает Endpoint без включения публичной проверки"
+
+(
+    TMP_FILES=""
+    trap cleanup EXIT
+    prepare_dialog_case edit-full-tunnel-endpoint
+    NDMC_BIN="$SCRIPT_DIR/mocks/ndmc-config-no-server"
+    printf '1\n172.16.6.1\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job add "" >/dev/null
+    printf '\n\n\n\n\n\n\n\n\n\n\n' > "$INPUT_DEVICE"
+    open_console
+    configure_job edit Wireguard8 > "$DIALOG_ROOT/edit-output"
+    assert_contains "$DIALOG_ROOT/edit-output" 'В Endpoint выбранного пира найден публичный адрес: 198.51.100.8' "Endpoint full-tunnel в редакторе"
+    assert_contains "$CONFIG_DIR/Wireguard8.conf" "WG_SERVER_TUNNEL_IP='172.16.6.1'" "ручной адрес сохранён"
+    assert_contains "$CONFIG_DIR/Wireguard8.conf" "WG_SERVER_PUBLIC_IP=''" "публичная проверка не включена сама"
+)
+pass "редактор full-tunnel показывает Endpoint при ручном внутреннем адресе"
 
 # Regression: --force on an empty installation never asks for confirmation.
 (

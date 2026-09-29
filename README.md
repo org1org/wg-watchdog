@@ -1,18 +1,18 @@
 <div align="left">
 
 <pre>
-__        __    ____    __  __
-\ \      / /   / ___|  |  \/  |
- \ \ /\ / /   | |  _   | |\/| |
-  \ V  V /    | |_| |  | |  | |
-   \_/\_/      \____|  |_|  |_|
+__        __   ____   __        __  __  __
+\ \      / /  / ___|  \ \      / / |  \/  |
+ \ \ /\ / /  | |  _    \ \ /\ / /  | |\/| |
+  \ V  V /   | |_| |    \ V  V /   | |  | |
+   \_/\_/     \____|     \_/\_/    |_|  |_|
 </pre>
 
 ### WG Watchdog Manager
 
 Лёгкий менеджер автоматического восстановления WireGuard на KeeneticOS.
 
-[![version](https://img.shields.io/badge/version-1.1.0-blue)](https://github.com/org1org/wg-watchdog/releases/latest)
+[![version](https://img.shields.io/badge/version-1.1.1-blue)](https://github.com/org1org/wg-watchdog/releases/latest)
 ![shell](https://img.shields.io/badge/shell-POSIX%20sh-4EAA25)
 ![platform](https://img.shields.io/badge/platform-KeeneticOS%205%2B-009EE2)
 ![environment](https://img.shields.io/badge/environment-Entware-555555)
@@ -62,6 +62,9 @@ wgwm
 сервера и внешний Endpoint подставляются из конфигурации пира, когда их удаётся
 определить автоматически.
 
+Если внутренний адрес не отвечает, мастер предложит перезапустить интерфейс
+и повторить проверку. Перезапуск выполняется только после подтверждения.
+
 ## Использование
 
 Для настроенного интерфейса доступны:
@@ -96,7 +99,7 @@ wgwm --uninstall     # удаление программы
 | Ошибок до перезапуска | 2 |
 | Пауза между `down` и `up` | 3 секунды |
 | Проверка после перезапуска | через 15 секунд |
-| Cooldown между перезапусками | 30 минут |
+| Cooldown между перезапусками | 5 минут |
 | Пауза после загрузки роутера | 180 секунд |
 
 Все значения можно изменить отдельно для каждого интерфейса.
